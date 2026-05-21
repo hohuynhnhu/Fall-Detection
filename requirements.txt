@@ -1,0 +1,23 @@
+opencv-python
+mediapipe==0.10.11
+ultralytics
+fastapi
+uvicorn
+numpy
+httpx
+pydantic>=2.0
+pillow
+torch
+torchvision
+
+# Audio detection (YAMNet) — optional; app runs without these
+tensorflow>=2.13
+tensorflow-hub>=0.15
+sounddevice>=0.4
+
+# Cloudinary + env
+cloudinary>=1.36
+python-dotenv>=1.0
+
+# Face recognition (dlib) — optional; requires C++ build tools on Windows
+# Install via: pip install dlib (or use pre-built wheel)

@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
+*.pt
+*.onnx
+data
+**/dataset/
+**/dataset_1/
+.env
+clips/

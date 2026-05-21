@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('data/label_tool.py'\\).read\\(\\)\\); print\\('OK - no syntax errors'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('data/label_tool.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK - no syntax errors'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('data/label_tool.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python *)",
+      "Bash(Get-ChildItem -Path \"D:\\\\luan_van\\\\Fall-Detection\" -Recurse)",
+      "Bash(Select-Object FullName)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(findstr /V \"tensorflow oneDNN\")",
+      "Bash(set PYTHONIOENCODING=utf-8)"
+    ]
+  }
+}

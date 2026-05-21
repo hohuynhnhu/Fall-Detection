@@ -1,193 +1,134 @@
-<div align="center">
+# Fall Detection Desktop System
 
-# 🏥 Smart Fall Detection
-
-**Hệ thống phát hiện té ngã thông minh cho người cao tuổi**
-
-[![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)](https://python.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
-[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://docker.com)
-[![YOLO](https://img.shields.io/badge/YOLOv8-Pose-FF6B35?logo=ultralytics&logoColor=white)](https://ultralytics.com)
-[![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
-
-<img src="docs/architecture.png" alt="System Architecture" width="700"/>
-
-> Kết hợp **YOLO Pose + GCN + TCN** để phát hiện té ngã theo thời gian thực,  
-> tích hợp nhận diện khuôn mặt và **cá nhân hóa theo bệnh án** từng người cao tuổi.
-
-</div>
+Hệ thống phát hiện té ngã realtime chạy trên máy tính, kết hợp **Rule-based** và **AI Transformer**.
 
 ---
 
-## 📌 Tổng quan
-
-**Smart Fall Detection** là hệ thống giám sát thông minh giúp phát hiện té ngã của người cao tuổi trong môi trường gia đình. Hệ thống không chỉ phát hiện té ngã mà còn **nhận diện từng thành viên** trong gia đình để tự động điều chỉnh mức độ nhạy cảnh báo dựa trên **hồ sơ bệnh án cá nhân**.
-
----
-
-## ✨ Tính năng chính
-
-- 🦴 **Phát hiện dáng người** — YOLO Pose trích xuất 17 keypoints skeleton theo thời gian thực
-- 🧠 **Nhận diện té ngã** — GCN + TCN học đặc trưng không gian & thời gian của chuyển động
-- 👤 **Nhận diện thành viên** — dlib xác định danh tính khuôn mặt trong gia đình
-- 📋 **Cá nhân hóa theo bệnh án** — tự động tăng độ nhạy nếu người dùng có tiền sử té ngã, Parkinson, xương khớp yếu...
-- 🚨 **Cảnh báo tức thời** — gửi thông báo ngay khi phát hiện té ngã
-- 🐳 **Docker ready** — triển khai dễ dàng với Docker Compose
-
----
-
-## 🏗️ Kiến trúc hệ thống
+## Cấu trúc thư mục
 
 ```
-Camera / Video Input
-        ↓
-┌─────────────────────────────┐
-│       Detector Service       │
-│                             │
-│  YOLO Pose → Keypoints      │
-│  dlib      → Face ID        │
-│  GCN + TCN → Fall Detection │
-└────────────┬────────────────┘
-             │ Redis Queue
-┌────────────▼────────────────┐
-│         API Service          │
-│                             │
-│  FastAPI  → REST API        │
-│  Medical  → Điều chỉnh ngưỡng│
-│  Alert    → Gửi cảnh báo    │
-└────────────┬────────────────┘
-             │
-       PostgreSQL DB
+src/
+├── core/
+│   ├── pose_engine.py        # Trích xuất keypoints (MediaPipe + YOLO)
+│   ├── fall_detector.py      # Phát hiện té ngã rule-based
+│   ├── transformer_engine.py # Phân loại fall/non-fall bằng AI
+│   ├── camera_worker.py      # Thread điều phối camera + các engine
+│   ├── face_engine.py        # Nhận diện khuôn mặt (dlib)
+│   ├── audio_engine.py       # Phát hiện âm thanh (YAMNet)
+│   └── overlay.py            # Vẽ UI lên camera frame
+├── services/
+│   └── backend_client.py     # Giao tiếp với backend API
+├── app.py                    # Entry point — Tkinter UI
+├── schemas.py                # Pydantic data models
+└── yolov8n-pose.pt           # YOLO Pose model
 ```
 
 ---
 
-## 🛠️ Công nghệ sử dụng
-
-| Thành phần | Công nghệ |
-|---|---|
-| Pose Estimation | YOLOv8 Pose |
-| Fall Detection | GCN + TCN |
-| Face Recognition | dlib |
-| Backend API | FastAPI |
-| Database | PostgreSQL |
-| Message Queue | Redis |
-| Containerization | Docker + Docker Compose |
-
----
-
-## 📁 Cấu trúc dự án
+## Pipeline
 
 ```
-smart-fall-detection/
-├── data/
-│   ├── raw/                   # Dữ liệu thô
-│   ├── processed/             # Dữ liệu đã xử lý
-│   └── profiles/              # Hồ sơ thành viên gia đình
-├── models/
-│   ├── yolo/                  # YOLOv8 Pose weights
-│   ├── gcn_tcn/               # GCN + TCN checkpoints
-│   └── face/                  # dlib face models
-├── src/
-│   ├── detection/
-│   │   ├── pose/              # YOLO Pose pipeline
-│   │   ├── fall/              # GCN + TCN inference
-│   │   └── face/              # dlib face recognition
-│   ├── medical/               # Xử lý bệnh án, điều chỉnh ngưỡng
-│   ├── alert/                 # Gửi cảnh báo
-│   └── api/                   # FastAPI routes & models
-├── docker/
-│   ├── Dockerfile.api
-│   └── Dockerfile.detector
-├── docker-compose.yml
-└── README.md
+Camera / RTSP
+      ↓
+pose_engine        →  BodyMetrics + raw_kp (200,)
+      ├── fall_detector      →  is_falling  (Rule-based)
+      ├── transformer_engine →  is_fall     (AI Transformer)
+      ├── face_engine        →  tên người   (optional)
+      └── audio_engine       →  âm thanh    (optional)
+      ↓
+camera_worker  →  WorkerFrame  →  queue
+      ↓
+app.py  →  kết hợp kết quả  →  hiển thị + gửi backend
 ```
 
 ---
 
-## 🚀 Cài đặt & Chạy
+## Cách phát hiện té ngã
 
-### Yêu cầu
+### Rule-based (`fall_detector.py`)
 
-- Docker & Docker Compose
-- NVIDIA GPU + [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) *(nếu dùng GPU)*
+| Điều kiện              | Mô tả              |
+| ---------------------- | ------------------ |
+| `velocity_y > 80 px/s` | Hạ xuống nhanh     |
+| `was STANDING/WALKING` | Trước đó đứng/đi   |
+| `LYING >= 5 frames`    | Đang nằm liên tiếp |
+| `transition < 2s`      | Chuyển đổi nhanh   |
 
-### 1. Clone repo
+### AI Transformer (`transformer_engine.py`)
+
+- Input: sliding window **30 frames × 200 features** (MediaPipe 33 kp + YOLO 17 kp)
+- Normalize per-sequence trước khi infer
+- Output: `P(fall)` — ngưỡng mặc định **0.6**
+- Kết quả train: **Mean 97.8% ± 1.2%**, Miss Rate **1.5%**
+
+### Kết hợp
+
+```
+any_fall = rule_fall AND ai_fall
+```
+
+---
+
+## Các tính năng
+
+| Tính năng      | Mô tả                      | Bật/Tắt           |
+| -------------- | -------------------------- | ----------------- |
+| YOLO Pose      | Hỗ trợ MediaPipe khi tối   | Checkbox UI       |
+| Face ID        | Nhận diện khuôn mặt (dlib) | Checkbox UI / API |
+| AI Transformer | Phân loại fall/non-fall    | Checkbox UI       |
+| Audio (YAMNet) | Phát hiện âm thanh té ngã  | API backend       |
+| Sleep-as-fall  | Nằm lâu = té ngã           | API backend       |
+| RTSP           | Kết nối camera IP          | Nhập URL          |
+
+---
+
+## Cài đặt
 
 ```bash
-git clone https://github.com/your-username/smart-fall-detection.git
-cd smart-fall-detection
+pip install mediapipe ultralytics torch opencv-python pillow pydantic dlib
 ```
 
-### 2. Cấu hình môi trường
+**Model files cần có:**
+
+```
+models/face/shape_predictor_68_face_landmarks.dat
+models/face/dlib_face_recognition_resnet_model_v1.dat
+train_tranformer/dataset_1/checkpoints1/best_model.pth
+```
+
+---
+
+## Chạy
 
 ```bash
-cp .env.example .env
-# Chỉnh sửa .env theo cấu hình của bạn
-```
-
-### 3. Chạy với Docker
-
-```bash
-# Build và khởi động toàn bộ hệ thống
-docker-compose up --build
-
-# Chạy nền
-docker-compose up -d --build
-```
-
-### 4. Truy cập API
-
-```
-http://localhost:8000/docs
+cd src
+python app.py
 ```
 
 ---
 
-## ⚙️ Cấu hình `.env`
+## Dataset & Training
 
-```env
-# Database
-DATABASE_URL=postgresql://admin:yourpassword@db:5432/fall_detection
+```
+fall:     204 video (~3s) — đi → té → nằm
+non_fall: 204 video (~3-6s) — đứng/ngồi → nằm
 
-# Redis
-REDIS_HOST=redis
-REDIS_PORT=6379
+Sampling:
+  fall     → toàn bộ video
+  non_fall → 3s cuối (lúc hành động nằm xuống)
 
-# Fall Detection
-FALL_SENSITIVITY_DEFAULT=0.7
-FALL_SENSITIVITY_HIGH=0.5     # Dùng cho người có bệnh án nguy cơ cao
+num_frames = 30 | input_dim = 200 | K-Fold = 5
 ```
 
 ---
 
-## 🔬 Nghiên cứu & Mô hình
+## Ngưỡng mặc định
 
-### Pipeline phát hiện té ngã
-
-1. **YOLO Pose** trích xuất 17 keypoints từ khung hình
-2. Keypoints được đưa vào **GCN** để học mối quan hệ không gian giữa các khớp
-3. **TCN** học chuỗi chuyển động theo thời gian
-4. Kết hợp đặc trưng → phân loại: `normal` / `falling` / `fallen`
-
-### Cá nhân hóa theo bệnh án
-
-Khi hệ thống nhận diện được khuôn mặt thành viên gia đình, API sẽ tra cứu hồ sơ bệnh án và điều chỉnh ngưỡng phát hiện:
-
-| Tình trạng | Độ nhạy |
-|---|---|
-| Bình thường | 0.7 |
-| Tiền sử té ngã | 0.5 |
-| Parkinson / xương khớp yếu | 0.4 |
-
----
-
-## 📄 License
-
-MIT License — xem [LICENSE](LICENSE) để biết thêm chi tiết.
-
----
-
-<div align="center">
-Made with ❤️ for elderly care
-</div>
+| Tham số                   | Giá trị | Mô tả                     |
+| ------------------------- | ------- | ------------------------- |
+| `fall_velocity_threshold` | 80 px/s | Tốc độ hạ để trigger      |
+| `body_angle_lying`        | 65°     | Góc thân để coi là nằm    |
+| `aspect_ratio_lying`      | 0.55    | H/W bbox để coi là nằm    |
+| `fall_confirm_frames`     | 5       | Frame LYING liên tiếp     |
+| `fall_transition_max_s`   | 2.0s    | Thời gian tối đa đứng→nằm |
+| `fall_threshold` (AI)     | 0.6     | P(fall) để kết luận       |
