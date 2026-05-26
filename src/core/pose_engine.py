@@ -269,6 +269,13 @@ class PoseEngine:
                 if mp_raw is not None:
                     mp_kp = mp_raw
                 if mp_m is not None:
+                    # MediaPipe nhận crop → tọa độ trả về là hệ crop (pixel).
+                    # Phải cộng offset bbox để đưa về hệ full-frame trước khi fusion với YOLO.
+                    mp_m.center_x   += x1;  mp_m.center_y   += y1
+                    mp_m.shoulder_y += y1;  mp_m.hip_y      += y1
+                    mp_m.ankle_y    += y1;  mp_m.knee_l_y   += y1
+                    mp_m.knee_r_y   += y1;  mp_m.nose_y     += y1
+                    mp_m.wrist_l_y  += y1;  mp_m.wrist_r_y  += y1
                     mp_metrics = mp_m
 
             # Fusion raw_kp
