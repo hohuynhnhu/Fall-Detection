@@ -38,14 +38,22 @@ from .overlay import STATE_SKELETON_COLORS
 from    schemas import ThresholdConfig, FeatureConfig, PoseState, FallEvent, EventType
 
 try:
-    from .face_engine import FaceEngine, RecognizedPerson
+    from .face_engine import FaceEngine, RecognizedPerson, FaceBox
     FACE_ENGINE_AVAILABLE = True
 except (ImportError, Exception):
     FACE_ENGINE_AVAILABLE = False
     RecognizedPerson = object  # type: ignore
+    FaceBox          = object  # type: ignore
+
+try:
+    from .appearance_tracker import TrackerManager
+    TRACKER_AVAILABLE = True
+except (ImportError, Exception):
+    TRACKER_AVAILABLE = False
 
 try:
     from .transformer_engine import TransformerEngine, TransformerResult
+    # from .transformer_engine_1 import TransformerEngine1 as TransformerEngine, TransformerResult
     TRANSFORMER_AVAILABLE = True
 except (ImportError, Exception):
     TRANSFORMER_AVAILABLE = False
@@ -91,6 +99,7 @@ class CameraWorker(threading.Thread):
         features:        Optional[FeatureConfig]   = None,
         camera_id:       str                       = "cam_0",
         backend_client:  Optional[Any]             = None,
+        family_manager:  Optional[Any]             = None,
     ):
         super().__init__(daemon=True)
         self.camera_source   = camera_source
@@ -102,6 +111,7 @@ class CameraWorker(threading.Thread):
         self.features        = features or FeatureConfig()
         self.camera_id       = camera_id
         self._backend_client = backend_client
+        self._family_manager = family_manager
         self._is_stream      = isinstance(camera_source, str) and "://" in camera_source
         self._running        = False
         self._paused         = False
@@ -122,6 +132,13 @@ class CameraWorker(threading.Thread):
         self.fps             = 0.0
         self._last_frame:    Optional[np.ndarray] = None
         self._pending_audio: Optional[AudioResult] = None
+
+        # Appearance tracker — face-once + appearance tracking
+        self._tracker:             Optional[TrackerManager] = None
+        self._frame_num:           int  = 0
+        self._pending_recognition: dict = {}   # {tracker_id: last_tried_frame}
+        self._yolo_to_tracker:     dict = {}   # {yolo_person_id: tracker_id}
+        self._face_log_sent:       dict = {}   # {tracker_id: last_logged_person_id}
 
         # Rolling buffer: 300 frames = 10 s @ 30 fps
         self._frame_buffer: deque = deque(maxlen=300)
@@ -214,6 +231,10 @@ class CameraWorker(threading.Thread):
             self._person_pipelines.pop(pid, None)
             self._person_transformers.pop(pid, None)
             self._person_last_seen.pop(pid, None)
+            t_id = self._yolo_to_tracker.pop(pid, None)
+            if t_id is not None:
+                self._pending_recognition.pop(t_id, None)
+                self._face_log_sent.pop(t_id, None)
             print(f"[CameraWorker] Person lost: ID={pid}")
 
     # ── Callbacks ──────────────────────────────────────────────────────────────
@@ -245,11 +266,35 @@ class CameraWorker(threading.Thread):
         )
         self._pipeline = DetectionPipeline(config=self.config, features=self.features)
 
+        def _face_log(msg):
+            print(f"[Face] {msg}")
+            if self._family_manager and self._family_manager._on_log:
+                self._family_manager._on_log(msg)
+
+        _face_log(f"use_face={self.use_face} | face_ok={FACE_ENGINE_AVAILABLE} | feature_on={self.features.enable_face_recognition}")
+
         if self.use_face and self.features.enable_face_recognition and FACE_ENGINE_AVAILABLE:
             try:
+                _face_log("Đang load FaceEngine (YOLOv8s + InsightFace)...")
                 self._face_engine = FaceEngine()
+                _face_log("✓ FaceEngine sẵn sàng")
+                if self._family_manager is not None:
+                    _face_log("Đang khởi động FamilyManager...")
+                    self._family_manager.start()
+                    self._face_engine.set_family_manager(self._family_manager)
+                    _face_log("✓ FamilyManager đã khởi động")
+                else:
+                    _face_log("FamilyManager=None — dùng local face_db.pkl")
             except Exception as e:
-                print(f"[CameraWorker] FaceEngine init failed: {e}")
+                _face_log(f"✗ FaceEngine init lỗi: {e}")
+        elif self.use_face and not FACE_ENGINE_AVAILABLE:
+            _face_log("✗ ultralytics hoặc insightface chưa cài")
+
+        if self._face_engine is not None and TRACKER_AVAILABLE:
+            self._tracker = TrackerManager()
+            _face_log("✓ AppearanceTracker initialized (face-once + appearance tracking)")
+        elif self.use_face and not self.features.enable_face_recognition:
+            _face_log("⚠ Feature enable_face_recognition=False từ backend — bị tắt")
 
         if self.use_transformer and TRANSFORMER_AVAILABLE:
             try:
@@ -299,6 +344,9 @@ class CameraWorker(threading.Thread):
             self._last_frame = frame
 
             # ── Xử lý nhiều người ─────────────────────────────────────────────
+            self._frame_num += 1
+            face_active = (self._face_engine is not None and
+                           self.features.enable_face_recognition)
             self._cleanup_lost_persons()
             persons_data     = self._engine.process_multi(frame)
             all_person_results: List[PersonResult] = []
@@ -354,6 +402,106 @@ class CameraWorker(threading.Thread):
                         trans_result = person_trans,
                     ))
 
+                    # ── Appearance tracking + face-once recognition ───────────
+                    if face_active and self._tracker is not None:
+                        box      = pd.bbox
+                        track_id = self._tracker.match_box(box, self._frame_num)
+
+                        if track_id is None:
+                            if self._tracker.has_track(pd.person_id):
+                                # Same YOLO ID but IoU < 0.4 (large movement)
+                                track_id = pd.person_id
+                                self._tracker.update_last_box(
+                                    track_id, box, self._frame_num)
+                            else:
+                                # Genuinely new detection
+                                track_id = pd.person_id
+                                self._tracker.add_track(
+                                    track_id, None, "", False, None,
+                                    box, self._frame_num,
+                                )
+                                print(f"[Tracker] New person detected: track_id={track_id}")
+                        self._yolo_to_tracker[pd.person_id] = track_id
+
+                        if not self._tracker.is_identified(track_id):
+                            # Run face recognition every 5 frames until identified
+                            last_tried = self._pending_recognition.get(track_id, -100)
+                            if self._frame_num - last_tried >= 5:
+                                self._pending_recognition[track_id] = self._frame_num
+                                try:
+                                    p_info = self._face_engine.run_face_recognition(
+                                        frame, box)
+                                except Exception:
+                                    p_info = None
+                                if p_info is not None and p_info.is_known:
+                                    self._tracker.update_track_identity(
+                                        track_id,
+                                        p_info.person_id,
+                                        p_info.name,
+                                        p_info.is_patient,
+                                    )
+                                    self._pending_recognition.pop(track_id, None)
+                                    print(f"[Tracker] Identified: {p_info.name}")
+                                    # Gửi log lần đầu (hoặc khi person_id thay đổi)
+                                    if self._face_log_sent.get(track_id) != p_info.person_id:
+                                        self._face_log_sent[track_id] = p_info.person_id
+                                        if self._backend_client is not None:
+                                            self._backend_client.post_face_log(
+                                                person_id  = p_info.person_id,
+                                                name       = p_info.name,
+                                                is_patient = p_info.is_patient,
+                                                confidence = p_info.confidence,
+                                                camera_id  = self.camera_id,
+                                            )
+                        else:
+                            # Known track — refresh appearance every 10 frames
+                            if self._frame_num % 10 == 0:
+                                try:
+                                    snap = self._face_engine.extract_appearance(
+                                        frame, box)
+                                except Exception:
+                                    snap = None
+                                if snap is not None:
+                                    reason = self._tracker._reidentify_reason(
+                                        track_id, snap)
+                                    if reason:
+                                        t_info = self._tracker.get_track_info(track_id)
+                                        t_name = t_info.get("name", "?") if t_info else "?"
+                                        print(
+                                            f"[Tracker] Re-ID triggered ({reason}): "
+                                            f"{t_name}"
+                                        )
+                                        try:
+                                            p_info = self._face_engine.run_face_recognition(
+                                                frame, box)
+                                        except Exception:
+                                            p_info = None
+                                        if p_info is not None and p_info.is_known:
+                                            self._tracker.update_track_identity(
+                                                track_id,
+                                                p_info.person_id,
+                                                p_info.name,
+                                                p_info.is_patient,
+                                            )
+                                            print(f"[Tracker] Identified: {p_info.name}")
+                                            # Re-ID → log nếu người thay đổi
+                                            if self._face_log_sent.get(track_id) != p_info.person_id:
+                                                self._face_log_sent[track_id] = p_info.person_id
+                                                if self._backend_client is not None:
+                                                    self._backend_client.post_face_log(
+                                                        person_id  = p_info.person_id,
+                                                        name       = p_info.name,
+                                                        is_patient = p_info.is_patient,
+                                                        confidence = p_info.confidence,
+                                                        camera_id  = self.camera_id,
+                                                    )
+                                    self._tracker.update_snapshot(
+                                        track_id, snap, self._frame_num)
+
+                # Remove stale tracks once per frame (after all boxes processed)
+                if self._tracker is not None:
+                    self._tracker.remove_stale(self._frame_num, max_gap=60)
+
                 # Ưu tiên người đang té để hiển thị lên UI
                 fall_persons = [r for r in all_person_results
                                 if r.result.is_falling]
@@ -374,14 +522,29 @@ class CameraWorker(threading.Thread):
                     self._audio_engine.trigger()
 
             # ── Face recognition ───────────────────────────────────────────────
-            persons    = []
-            face_active = (self._face_engine is not None and
-                           self.features.enable_face_recognition)
+            persons = []
             if face_active:
-                try:
-                    persons = self._face_engine.process(frame)
-                except Exception:
-                    pass
+                if self._tracker is not None and all_person_results:
+                    # Multi-person: build recognized_persons from tracker identities
+                    for pr in all_person_results:
+                        t_key = self._yolo_to_tracker.get(pr.person_id, pr.person_id)
+                        t_info = self._tracker.get_track_info(t_key)
+                        if t_info and t_info["person_id"]:
+                            x1, y1, x2, y2 = pr.bbox
+                            persons.append(RecognizedPerson(
+                                person_id  = t_info["person_id"],
+                                name       = t_info["name"],
+                                confidence = 1.0,
+                                box        = FaceBox(x1, y1, x2, y2),
+                                is_known   = True,
+                                is_patient = t_info["is_patient"],
+                            ))
+                else:
+                    # Single-person fallback: original per-frame recognition
+                    try:
+                        persons = self._face_engine.process_frame(frame)
+                    except Exception:
+                        pass
 
             # ── FPS ───────────────────────────────────────────────────────────
             self._fps_counter += 1

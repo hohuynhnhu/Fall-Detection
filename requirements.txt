@@ -19,5 +19,7 @@ sounddevice>=0.4
 cloudinary>=1.36
 python-dotenv>=1.0
 
-# Face recognition (dlib) — optional; requires C++ build tools on Windows
-# Install via: pip install dlib (or use pre-built wheel)
+# Face recognition — InsightFace buffalo_l (ArcFace, 512-d) + ONNX runtime
+insightface
+onnxruntime-gpu       # CUDA; swap for onnxruntime if no GPU
+websockets

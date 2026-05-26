@@ -22,7 +22,7 @@ from services.backend_client import BackendClient
 from schemas import (
     ThresholdConfig, FeatureConfig, FallEvent, PoseEvent,
     PoseState, EventType, BodyMetricsPayload,
-    PersonDetectedPayload, AddFamilyMemberPayload,
+    PersonDetectedPayload, AddFamilyMemberPayload, PatientPoseEvent,
 )
 
 # ─── Theme ─────────────────────────────────────────────────────────────────────
@@ -72,6 +72,16 @@ def _btn(parent, text, cmd, bg=None, fg="#000", **kw):
                      relief="flat", cursor="hand2", padx=8, pady=6, **kw)
 
 
+# ─── Helpers ───────────────────────────────────────────────────────────────────
+
+def _face_center_in_bbox(face_box, person_bbox: tuple) -> bool:
+    """Kiểm tra tâm khuôn mặt có nằm trong bounding box người không."""
+    cx = (face_box.x1 + face_box.x2) // 2
+    cy = (face_box.y1 + face_box.y2) // 2
+    x1, y1, x2, y2 = person_bbox
+    return x1 <= cx <= x2 and y1 <= cy <= y2
+
+
 # ─── Family Management Window ───────────────────────────────────────────────────
 
 class FamilyManagementWindow(tk.Toplevel):
@@ -97,11 +107,12 @@ class FamilyManagementWindow(tk.Toplevel):
                       highlightbackground=T["border"], highlightthickness=1)
         lf.pack(fill="both", expand=True, padx=16, pady=6)
 
-        cols = ("Tên", "Vai trò", "Mẫu", "ID")
+        cols = ("Tên", "Vai trò", "Bệnh nhân", "Mẫu", "ID")
         self._tree = ttk.Treeview(lf, columns=cols, show="headings", height=14)
+        col_widths = {"Tên": 110, "Vai trò": 80, "Bệnh nhân": 70, "Mẫu": 50, "ID": 70}
         for c in cols:
             self._tree.heading(c, text=c)
-            self._tree.column(c, width=100 if c != "ID" else 80, anchor="center")
+            self._tree.column(c, width=col_widths.get(c, 80), anchor="center")
         self._tree.pack(side="left", fill="both", expand=True)
         sb = tk.Scrollbar(lf, command=self._tree.yview)
         sb.pack(side="right", fill="y")
@@ -126,8 +137,11 @@ class FamilyManagementWindow(tk.Toplevel):
         if self._app._worker and self._app._worker._face_engine:
             members = self._app._worker._face_engine.list_members()
         for m in members:
-            self._tree.insert("", "end",
-                              values=(m["name"], m["role"], m["sample_count"], m["person_id"]))
+            patient_mark = "✓" if m.get("is_patient") else ""
+            self._tree.insert("", "end", values=(
+                m["name"], m["role"], patient_mark,
+                m["sample_count"], m["person_id"],
+            ))
         self._status.config(text=f"{len(members)} thành viên trong database")
 
     def _add(self):
@@ -148,20 +162,35 @@ class FamilyManagementWindow(tk.Toplevel):
             return
         role = simpledialog.askstring("Vai trò", "Vai trò (family / caregiver):",
                                       initialvalue="family", parent=self) or "family"
+        is_patient = messagebox.askyesno(
+            "Bệnh nhân",
+            f"'{name.strip()}' có phải bệnh nhân cần theo dõi tư thế không?\n\n"
+            "• Có  → hệ thống sẽ gửi thông báo trạng thái (đứng/ngồi/nằm/đi) về mobile\n"
+            "• Không → chỉ nhận diện danh tính bình thường",
+            parent=self,
+        )
 
-        pid = fe.enroll(frame, name=name.strip(), role=role.strip())
+        pid = fe.enroll(frame, name=name.strip(), role=role.strip(), is_patient=is_patient)
         if pid is None:
             messagebox.showerror("Không phát hiện khuôn mặt",
                                  "Không thấy khuôn mặt trong frame hiện tại.\n"
                                  "Hãy đứng trước camera rồi thử lại.", parent=self)
             return
 
+        # Đồng bộ vào FamilyManager (in-memory dict) nếu đang active
+        fm = self._app._family_manager
+        if fm is not None:
+            enc = fe.db.members[pid]["encodings"][-1]
+            fm.add_encoding(pid, name.strip(), is_patient, enc)
+
         # Sync metadata lên backend (không bắt buộc — bỏ qua nếu offline)
-        payload = AddFamilyMemberPayload(person_id=pid, name=name.strip(), role=role.strip())
+        payload = AddFamilyMemberPayload(
+            person_id=pid, name=name.strip(), role=role.strip(), is_patient=is_patient)
         ok = self._app._backend.add_family_member_sync(payload)
         suffix = "" if ok else " (backend offline — lưu local)"
+        patient_note = " [BỆNH NHÂN]" if is_patient else ""
         messagebox.showinfo("Thành công",
-                            f"Đã thêm '{name}' (ID: {pid}){suffix}", parent=self)
+                            f"Đã thêm '{name}'{patient_note} (ID: {pid}){suffix}", parent=self)
         self._refresh()
 
     def _delete(self):
@@ -169,13 +198,15 @@ class FamilyManagementWindow(tk.Toplevel):
         if not sel:
             return
         values = self._tree.item(sel[0], "values")
-        pid, name = values[3], values[0]
+        pid, name = values[4], values[0]
         if not messagebox.askyesno("Xác nhận", f"Xóa '{name}' khỏi database?", parent=self):
             return
 
         fe = self._app._worker._face_engine if self._app._worker else None
         if fe:
             fe.remove_member(pid)
+        if self._app._family_manager:
+            self._app._family_manager.remove(pid)
         self._app._backend.remove_family_member_sync(pid)
         self._refresh()
 
@@ -203,8 +234,15 @@ class FallDetectionApp:
         self._trans_fall_logged  = False  # debounce AI fall log
         self._last_beep_t        = 0.0   # cooldown beep 3s
         self._lying_start_t      = 0.0   # track lying start for AI confirm logic
+        self._non_lying_streak   = 0     # frame đứng liên tiếp, dùng để reset _lying_start_t
         # Debounce gửi person-detected: {person_id: last_sent_time}
         self._person_sent_at: dict[str, float] = {}
+
+        # Theo dõi bệnh nhân: trạng thái và thời điểm gửi cuối
+        self._patient_last_state: dict[str, PoseState] = {}
+        self._patient_last_sent:  dict[str, float]     = {}
+
+        self._family_manager = None   # khởi tạo trong _start()
 
         self._backend = BackendClient(
             base_url="http://localhost:8000",
@@ -277,18 +315,6 @@ class FallDetectionApp:
         self._btn_stop.config(state="disabled")
         _btn(br, "↺  RESET", self._reset_falls, fg=T["text"]).pack(side="left", fill="x", expand=True)
 
-        # Nguồn camera / RTSP URL
-        sr = tk.Frame(ctrl, bg=T["card"]); sr.pack(fill="x", pady=(0, 2))
-        tk.Label(sr, text="Nguồn:", fg=T["sub"], bg=T["card"],
-                 font=("Courier New", 8), width=7, anchor="w").pack(side="left")
-        self._cam_var = tk.StringVar(value="0")
-        tk.Entry(sr, textvariable=self._cam_var,
-                 bg=T["panel"], fg=T["text"], insertbackground=T["text"],
-                 relief="flat", font=("Courier New", 8)
-                 ).pack(side="left", fill="x", expand=True)
-        tk.Label(ctrl, text="   0 · 1 · rtsp://ip:8080/h264_ulaw.sdp",
-                 fg=T["sub"], bg=T["card"], font=("Courier New", 6), anchor="w"
-                 ).pack(fill="x")
 
         # Checkboxes
         cr = tk.Frame(ctrl, bg=T["card"]); cr.pack(fill="x", pady=(6, 4))
@@ -390,7 +416,29 @@ class FallDetectionApp:
         _btn(fc, "👥 Quản lý thành viên", self._open_family_mgmt,
              fg=T["text"], bg=T["border"]).pack(fill="x", pady=(6, 0))
 
-        # ── 6. CHỈ SỐ (lưới 2 cột) ──────────────────────────────────────
+        # ── 6. BỆNH NHÂN THEO DÕI ───────────────────────────────────────
+        pc = _card(panel, "BỆNH NHÂN THEO DÕI", pady=6)
+        pt_row1 = tk.Frame(pc, bg=T["card"]); pt_row1.pack(fill="x")
+        tk.Label(pt_row1, text="Thông báo tư thế",
+                 font=("Courier New", 8), fg=T["sub"], bg=T["card"], anchor="w"
+                 ).pack(side="left")
+        self._patient_notify_badge = tk.Label(pt_row1, text="[API: —]",
+            font=("Courier New", 7), fg=T["sub"], bg=T["card"], anchor="e")
+        self._patient_notify_badge.pack(side="right")
+        self._patient_text = tk.Text(
+            pc, height=4, bg=T["panel"], fg=T["text"],
+            font=("Courier New", 8), relief="flat",
+            state="disabled", wrap="none",
+        )
+        self._patient_text.pack(fill="x")
+        self._patient_text.tag_configure("stand", foreground=T["stand"])
+        self._patient_text.tag_configure("sit",   foreground=T["sit"])
+        self._patient_text.tag_configure("lie",   foreground=T["lie"])
+        self._patient_text.tag_configure("walk",  foreground=T["walk"])
+        self._patient_text.tag_configure("fall",  foreground=T["fall"])
+        self._patient_text.tag_configure("dim",   foreground=T["sub"])
+
+        # ── 7. CHỈ SỐ (lưới 2 cột) ──────────────────────────────────────
         mc = _card(panel, "CHỈ SỐ", pady=6)
         metric_grid = [
             ("Vel Y",  "_lbl_vy",    "Vel X",  "_lbl_vx"),
@@ -410,7 +458,7 @@ class FallDetectionApp:
                     tk.Label(r, text="│", font=("Courier New", 9),
                              fg=T["border"], bg=T["card"]).pack(side="left", padx=4)
 
-        # ── 7. NGƯỠNG PHÁT HIỆN ─────────────────────────────────────────
+        # ── 8. NGƯỠNG PHÁT HIỆN ─────────────────────────────────────────
         tc = _card(panel, "NGƯỠNG PHÁT HIỆN", pady=6)
         for fname, label in [
             ("fall_velocity_threshold", "Fall vel"),
@@ -430,7 +478,7 @@ class FallDetectionApp:
         _btn(tc, "↑  APPLY", self._apply_thresh,
              fg=T["text"], bg=T["border"]).pack(fill="x", pady=(6, 0))
 
-        # ── 8. SỰ KIỆN ──────────────────────────────────────────────────
+        # ── 9. SỰ KIỆN ──────────────────────────────────────────────────
         lc = _card(panel, "SỰ KIỆN", pady=0)
         log_frame = tk.Frame(lc, bg=T["panel"])
         log_frame.pack(fill="both", expand=True)
@@ -459,20 +507,23 @@ class FallDetectionApp:
         else:
             self._log_ev("⚠ Backend offline — dùng config mặc định")
 
-        raw_src    = self._cam_var.get().strip()
-        cam_source = int(raw_src) if raw_src.isdigit() else raw_src
+        cam_source = 0  # webcam laptop
+
+        # Tự động bật face recognition nếu backend có thành viên với ảnh
+        use_face, self._family_manager = self._init_face_recognition()
 
         self._queue  = queue.Queue(maxsize=3)
         self._worker = CameraWorker(
             camera_source   = cam_source,
             result_queue    = self._queue,
             use_yolo        = self._yolo_var.get(),
-            use_face        = self._face_var.get(),
+            use_face        = use_face,
             use_transformer = self._transformer_var.get(),
             config          = self._config,
             features        = self._features,
             camera_id       = "cam_0",
             backend_client  = self._backend,
+            family_manager  = self._family_manager,
         )
         self._worker.start()
         self._running = True
@@ -480,12 +531,62 @@ class FallDetectionApp:
 
         self._btn_start.config(state="disabled")
         self._btn_stop.config(state="normal")
-        face_txt  = " | Face ID" if self._face_var.get()        else ""
+        face_txt  = " | Face ID" if use_face                      else ""
         trans_txt = " | AI"      if self._transformer_var.get() else ""
         yolo_txt  = " | YOLO"   if self._yolo_var.get()        else ""
         audio_txt = " | Audio"  if self._features.enable_sound_detection else ""
-        src_short = raw_src if len(raw_src) <= 30 else raw_src[:27] + "…"
-        self._log_ev(f"▶ {src_short}{yolo_txt}{face_txt}{trans_txt}{audio_txt}")
+        self._log_ev(f"▶ Webcam{yolo_txt}{face_txt}{trans_txt}{audio_txt}")
+
+    def _init_face_recognition(self):
+        """
+        Kiểm tra /family-members/all — nếu có ảnh thì bật face recognition,
+        không có thì bỏ qua (không load dlib, không tốn tài nguyên).
+        Trả về (use_face: bool, family_manager hoặc None).
+        """
+        import httpx
+        from core.family_manager import FamilyManager
+        def _log(msg):
+            print(f"[Face] {msg}")
+            self._log_ev(f"[Face] {msg}")
+
+        url = f"{self._backend.base_url}/family-members/all"
+        _log(f"GET {url}")
+        try:
+            r = httpx.get(url, timeout=3.0)
+            _log(f"HTTP {r.status_code}")
+            if r.status_code != 200:
+                _log(f"✗ API lỗi HTTP {r.status_code} — tắt nhận diện")
+                return False, None
+
+            raw = r.json()
+            members = raw.get("members", [])
+            _log(f"Nhận {len(members)} thành viên từ API")
+            _log(f"Raw JSON keys: {list(raw.keys())}")
+
+            if not members:
+                _log("Không có thành viên — tắt nhận diện")
+                return False, None
+
+            for m in members:
+                has_img = bool(m.get("face_image_url"))
+                tag = "✓ có ảnh" if has_img else "✗ không có ảnh"
+                _log(f"  {m.get('name','?')} — {tag} | keys={list(m.keys())}")
+
+            has_images = any(m.get("face_image_url") for m in members)
+            if not has_images:
+                _log("Không có face_image_url nào — tắt nhận diện")
+                return False, None
+
+            _log("Bật nhận diện — sẽ trích xuất đặc trưng sau khi camera khởi động")
+            fm = FamilyManager(
+                base_url=self._backend.base_url,
+                on_log=lambda msg: self.root.after(0, lambda m=msg: self._log_ev(m)),
+            )
+            return True, fm
+
+        except Exception as e:
+            _log(f"✗ Lỗi kết nối API: {e}")
+            return False, None
 
     def _stop(self):
         if not self._running:
@@ -493,6 +594,9 @@ class FallDetectionApp:
         self._running = False
         if self._worker:
             self._worker.stop()
+        if self._family_manager:
+            self._family_manager.stop()
+            self._family_manager = None
         self._backend.stop()
         self._btn_start.config(state="normal")
         self._btn_stop.config(state="disabled")
@@ -535,23 +639,27 @@ class FallDetectionApp:
         if self._worker:
             self._worker.update_features(feat)
         parts = []
-        if not feat.enable_face_recognition: parts.append("Face OFF")
-        if not feat.enable_sound_detection:  parts.append("Audio OFF")
-        if feat.sleep_as_fall:               parts.append("sleep=fall")
+        if not feat.enable_face_recognition:          parts.append("Face OFF")
+        if not feat.enable_patient_pose_notification: parts.append("Notify OFF")
+        if not feat.enable_sound_detection:           parts.append("Audio OFF")
+        if feat.sleep_as_fall:                        parts.append("sleep=fall")
         note = ", ".join(parts) if parts else "all features ON"
         self.root.after(0, lambda: self._log_ev(f"↓ Features từ backend: {note}"))
 
     def _sync_feature_badges(self):
         feat = self._features
-        face_state  = "BẬT" if feat.enable_face_recognition else "TẮT"
-        audio_state = "BẬT" if feat.enable_sound_detection  else "TẮT"
-        face_color  = T["ok"]   if feat.enable_face_recognition else T["danger"]
-        audio_color = T["ok"]   if feat.enable_sound_detection  else T["danger"]
+        face_state   = "BẬT" if feat.enable_face_recognition          else "TẮT"
+        audio_state  = "BẬT" if feat.enable_sound_detection           else "TẮT"
+        notify_state = "BẬT" if feat.enable_patient_pose_notification else "TẮT"
+        face_color   = T["ok"] if feat.enable_face_recognition          else T["danger"]
+        audio_color  = T["ok"] if feat.enable_sound_detection           else T["danger"]
+        notify_color = T["ok"] if feat.enable_patient_pose_notification else T["danger"]
         self._face_api_badge.config(
             text=f"[API: {face_state}]", fg=face_color)
         self._audio_api_badge.config(
             text=f"[API: {audio_state}]", fg=audio_color)
-        # Show sleep=fall indicator in audio panel
+        self._patient_notify_badge.config(
+            text=f"[API: {notify_state}]", fg=notify_color)
         if feat.sleep_as_fall:
             self._audio_class_lbl.config(
                 text="Chế độ: nằm = té ngã", fg=T["warn"])
@@ -664,20 +772,39 @@ class FallDetectionApp:
             str(PoseState.SITTING),
         )
 
-        # Cập nhật thời điểm bắt đầu nằm
-        if current_lying and not (str(result.prev_state) == str(PoseState.LYING)):
-            self._lying_start_t = time.time()
-        lying_duration = time.time() - self._lying_start_t if current_lying else 0.0
+
+        # Cập nhật thời điểm bắt đầu nằm — chống flicker:
+        # _lying_start_t chỉ reset sau >= 5 frame đứng liên tiếp (không phải 1 frame flicker)
+        if current_lying:
+            self._non_lying_streak = 0
+            if self._lying_start_t == 0.0:          # lần đầu vào LYING trong bout này
+                self._lying_start_t = time.time()
+            # else: giữ nguyên start time, không reset khi flicker quay lại LYING
+        else:
+            self._non_lying_streak += 1
+            if self._non_lying_streak >= 15:        # đứng dậy thật sự, không phải flicker
+                self._lying_start_t = 0.0
+        lying_duration = (
+            (time.time() - self._lying_start_t)
+            if (current_lying and self._lying_start_t > 0)
+            else float("inf")
+        )
+
+        #log
+        if current_lying and was_upright:
+            self._log_ev(
+                f"[VEL] vel_y={abs(vy):.0f}  dur={lying_duration:.1f}s  rule={rule_fall}  ai={tr.is_fall if tr and tr.ready else '-'}")
+
 
         # Bước 1: Transformer phát hiện FALL không?
         ai_sees_fall = (
             tr is not None and
             tr.ready and
             tr.is_fall and
-            vel_y_abs > 20.0 and        # velocity đủ lớn
+            vel_y_abs > 150.0 and        # velocity đủ lớn
             current_lying and           # đang nằm
             was_upright and             # trước đó đứng/đi/ngồi
-            lying_duration < 2.0        # trong 2s đầu nằm xuống
+            lying_duration < 1.0       # trong 2s đầu nằm xuống
         )
 
         # Bước 2: Nếu AI thấy FALL → hỏi rule-based xác nhận
@@ -686,6 +813,9 @@ class FallDetectionApp:
 
         # Chỉ báo khi CẢ 2 đồng ý
         any_fall = trans_fall
+        if current_lying and was_upright:
+            print(
+                f"[App] vel={vel_y_abs:.0f} ai={tr.is_fall if tr and tr.ready else '-'} rule={rule_fall} trans={trans_fall}")
 
         if any_fall:
             self._alert_blink = not self._alert_blink
@@ -735,13 +865,14 @@ class FallDetectionApp:
                 self._face_conf_lbl.config(
                     text=f"Confidence: {best.confidence:.0%}  |  ID: {best.person_id}",
                     fg=T["sub"])
-                self._send_person_detected(best, wf.timestamp)
             else:
                 self._face_name_lbl.config(text="Không nhận ra", fg=T["warn"])
                 self._face_conf_lbl.config(text=f"{len(persons)} khuôn mặt", fg=T["sub"])
         else:
             self._face_name_lbl.config(text="Chưa phát hiện", fg=T["sub"])
             self._face_conf_lbl.config(text="", fg=T["sub"])
+
+        self._send_person_detected(wf)
 
         # ── Beep cảnh báo khi phát hiện té ───────────────────────────────
         should_beep = result.fall_just_triggered or (trans_fall and not rule_fall
@@ -759,6 +890,9 @@ class FallDetectionApp:
                 f"v={result.fall_max_velocity:.0f}px/s  "
                 f"from={result.prev_state}  📹 ghi clip…"
             )
+
+        # ── Theo dõi tư thế bệnh nhân ─────────────────────────────────────
+        self._update_patient_monitoring(wf)
 
         # ── Periodic pose event (mỗi 30 frames) ───────────────────────────
         if self._frame_id % 30 == 0 and result.metrics:
@@ -827,23 +961,136 @@ class FallDetectionApp:
         else:
             self._audio_status_lbl.config(text="SẴN SÀNG", fg=T["ok"])
 
-    def _send_person_detected(self, person, timestamp: float):
-        """Gửi event person-detected với debounce 5 giây / người."""
-        now  = time.time()
-        last = self._person_sent_at.get(person.person_id, 0.0)
-        if now - last < 5.0:
+    def _send_person_detected(self, wf: "WorkerFrame"):
+        """Gửi event person-detected (debounce 5s) — đếm số người trong frame."""
+        now = time.time()
+        if now - self._person_sent_at.get("__cam__", 0.0) < 5.0:
             return
-        self._person_sent_at[person.person_id] = now
+
+        # Đếm số người từ YOLO multi-person hoặc single-person pose
+        if wf.all_person_results:
+            count = len(wf.all_person_results)
+            conf  = max(
+                (r.result.metrics.confidence for r in wf.all_person_results
+                 if r.result.metrics), default=0.0
+            )
+        elif wf.result.state != PoseState.UNKNOWN and wf.result.metrics:
+            count = 1
+            conf  = wf.result.metrics.confidence
+        else:
+            return  # không thấy ai
+
+        self._person_sent_at["__cam__"] = now
         self._backend.send_person_detected(PersonDetectedPayload(
-            event_type  = EventType.PERSON_DETECTED,
-            camera_id   = "cam_0",
-            timestamp   = timestamp,
-            person_id   = person.person_id,
-            person_name = person.name,
-            confidence  = person.confidence,
-            frame_id    = self._frame_id,
+            camera_id    = "cam_0",
+            timestamp    = wf.timestamp,
+            confidence   = conf,
+            person_count = count,
         ))
-        self._log_ev(f"👤 Nhận diện: {person.name} ({person.confidence:.0%})")
+
+    # ── Patient monitoring ────────────────────────────────────────────────────
+
+    def _get_patient_pose(self, person, wf: "WorkerFrame") -> PoseState:
+        """Khớp khuôn mặt với kết quả pose gần nhất (ưu tiên YOLO multi-person)."""
+        if wf.all_person_results:
+            for pr in wf.all_person_results:
+                if _face_center_in_bbox(person.box, pr.bbox):
+                    return pr.result.state
+            # Fallback: lấy người gần tâm khuôn mặt nhất
+            fcx = (person.box.x1 + person.box.x2) // 2
+            fcy = (person.box.y1 + person.box.y2) // 2
+            best_dist, best_state = float("inf"), PoseState.UNKNOWN
+            for pr in wf.all_person_results:
+                x1, y1, x2, y2 = pr.bbox
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                dist = ((fcx - cx) ** 2 + (fcy - cy) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist, best_state = dist, pr.result.state
+            if best_dist < 300:
+                return best_state
+        return wf.result.state  # single-person fallback
+
+    def _update_patient_monitoring(self, wf: "WorkerFrame"):
+        """Theo dõi và gửi tư thế cho từng bệnh nhân được nhận diện."""
+        fe = self._worker._face_engine if self._worker else None
+        patient_rows: list = []
+        now = time.time()
+
+        for person in wf.recognized_persons:
+            if not person.is_known:
+                continue
+            if not person.is_patient:
+                continue
+
+            current_state = self._get_patient_pose(person, wf)
+            last_state    = self._patient_last_state.get(person.person_id)
+            last_sent     = self._patient_last_sent.get(person.person_id, 0.0)
+
+            state_changed = current_state != last_state
+            heartbeat_due = now - last_sent >= 10.0
+
+            if state_changed or heartbeat_due:
+                self._patient_last_state[person.person_id] = current_state
+                self._patient_last_sent[person.person_id]  = now
+
+                if not self._features.enable_patient_pose_notification:
+                    continue  # không gửi thông báo, chỉ cập nhật state local
+
+                m = wf.result.metrics
+                event = PatientPoseEvent(
+                    event_type  = EventType.PATIENT_POSE,
+                    camera_id   = "cam_0",
+                    timestamp   = wf.timestamp,
+                    person_id   = person.person_id,
+                    person_name = person.name,
+                    state       = current_state,
+                    prev_state  = last_state or PoseState.UNKNOWN,
+                    metrics     = BodyMetricsPayload(
+                        body_angle   = m.body_angle   if m else 0.0,
+                        aspect_ratio = m.aspect_ratio if m else 0.0,
+                        center_x     = m.center_x     if m else 0.0,
+                        center_y     = m.center_y     if m else 0.0,
+                        confidence   = m.confidence   if m else 0.0,
+                        hip_y        = m.hip_y        if m else 0.0,
+                        shoulder_y   = m.shoulder_y   if m else 0.0,
+                        ankle_y      = m.ankle_y      if m else 0.0,
+                    ),
+                    frame_id = self._frame_id,
+                )
+                self._backend.send_patient_pose(event)
+
+                if state_changed and last_state is not None:
+                    lbl_old = STATE_LABELS_VN.get(last_state, "?")
+                    lbl_new = STATE_LABELS_VN.get(current_state, "?")
+                    self._log_ev(
+                        f"🏥 {person.name}: {lbl_old} → {lbl_new}")
+
+            patient_rows.append((person.name, current_state, now))
+
+        self._update_patient_panel(patient_rows)
+
+    _STATE_TAG = {
+        PoseState.STANDING: "stand", PoseState.SITTING: "sit",
+        PoseState.LYING:    "lie",   PoseState.WALKING: "walk",
+        PoseState.FALLING:  "fall",  PoseState.UNKNOWN: "dim",
+    }
+
+    def _update_patient_panel(self, rows: list):
+        """Cập nhật card BỆNH NHÂN THEO DÕI."""
+        w = self._patient_text
+        w.config(state="normal")
+        w.delete("1.0", "end")
+        if not rows:
+            w.insert("end", "  Chưa phát hiện bệnh nhân\n", "dim")
+        else:
+            for name, state, ts in rows:
+                label = STATE_LABELS_VN.get(state, "?")
+                t_str = time.strftime("%H:%M:%S", time.localtime(ts))
+                tag   = self._STATE_TAG.get(state, "dim")
+                w.insert("end", f"  {name:<14} ", "dim")
+                w.insert("end", f"{label:<8}", tag)
+                w.insert("end", f"  {t_str}\n", "dim")
+        w.config(state="disabled")
 
     def _log_ev(self, msg: str):
         self._log.config(state="normal")
