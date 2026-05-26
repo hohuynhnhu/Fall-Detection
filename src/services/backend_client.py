@@ -15,10 +15,11 @@ src/services/backend_client.py — HTTP client gửi events lên backend
 ── Mobile app GỌI (mobile → backend) — backend cần implement ─────────────────
   PATCH  /config/features           — bật/tắt tính năng từ mobile app
     Request body:
-      { "enable_face_recognition": bool,
-        "enable_sound_detection":  bool,
-        "sleep_as_fall":           bool,
-        "sound_listen_seconds":    float }   ← tất cả đều optional (partial update)
+      { "enable_face_recognition":         bool,   ← nhận diện + đăng ký khuôn mặt
+        "enable_patient_pose_notification": bool,   ← thông báo tư thế bệnh nhân
+        "enable_sound_detection":          bool,
+        "sleep_as_fall":                   bool,
+        "sound_listen_seconds":            float }   ← tất cả đều optional (partial update)
     Response: { "ok": true, "features": { ...updated FeatureConfig... } }
 
   PATCH  /config/thresholds         — chỉnh ngưỡng phát hiện từ mobile app
@@ -35,14 +36,14 @@ import httpx
 from typing import Optional, Callable, List, Union
 
 from schemas import (
-    ThresholdConfig, FeatureConfig, ConfigResponse,
-    FallEvent, PoseEvent, PersonDetectedPayload,
-    DeviceStatusPayload, DeviceStatusEnum,
+    ThresholdConfig, FeatureConfig,
+    FallEvent, PoseEvent, PersonDetectedPayload, PatientPoseEvent,
+    HeartbeatPayload, FaceLogPayload,
     AddFamilyMemberPayload, FamilyMember, FamilyMembersResponse,
     PoseState,
 )
 
-_AnyEvent = Union[FallEvent, PoseEvent, PersonDetectedPayload]
+_AnyEvent = Union[FallEvent, PoseEvent, PersonDetectedPayload, PatientPoseEvent, FaceLogPayload]
 
 
 class BackendClient:
@@ -60,7 +61,7 @@ class BackendClient:
         self.on_config_update  = on_config_update
         self.on_feature_update = on_feature_update
         self.status_interval   = status_interval
-        self.config_interval   = config_interval
+        self.config_interval   = 5.0  # spec: poll mỗi 5s
 
         self._loop:   Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread]          = None
@@ -85,13 +86,22 @@ class BackendClient:
 
     def stop(self):
         self._running = False
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
+        # Enqueue sentinel để unblock _event_send_loop đang chờ queue.get()
+        if self._loop and self._queue:
+            try:
+                self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
+            except Exception:
+                pass
 
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._main())
+        try:
+            self._loop.run_until_complete(self._main())
+        except Exception:
+            pass
+        finally:
+            self._loop.close()
 
     async def _main(self):
         self._queue = asyncio.Queue(maxsize=200)
@@ -100,7 +110,7 @@ class BackendClient:
             await asyncio.gather(
                 self._event_send_loop(client),
                 self._config_poll_loop(client),
-                self._device_status_loop(client),
+                self._heartbeat_loop(client),
             )
 
     # ── Public send API ────────────────────────────────────────────────────────
@@ -114,6 +124,29 @@ class BackendClient:
     def send_person_detected(self, event: PersonDetectedPayload):
         self._enqueue(event)
 
+    def send_patient_pose(self, event: PatientPoseEvent):
+        self._enqueue(event)
+
+    def post_face_log(
+        self,
+        person_id:     str,
+        name:          str,
+        is_patient:    bool,
+        confidence:    float,
+        camera_id:     str  = "cam_0",
+        recognized_at: float = 0.0,
+    ) -> None:
+        """Gửi log nhận diện khuôn mặt sau mỗi lần identify thành công. Non-blocking."""
+        import time as _time
+        self._enqueue(FaceLogPayload(
+            person_id     = person_id,
+            name          = name,
+            is_patient    = is_patient,
+            confidence    = max(0.0, min(1.0, confidence)),
+            camera_id     = camera_id,
+            recognized_at = recognized_at if recognized_at > 0 else _time.time(),
+        ))
+
     def update_stats(self, fps: float, pose: PoseState):
         self.current_fps  = fps
         self.current_pose = pose
@@ -121,32 +154,33 @@ class BackendClient:
     # ── Blocking helpers (UI startup / management dialogs) ────────────────────
 
     def fetch_config_sync(self) -> Optional[ThresholdConfig]:
+        """Lấy thresholds + features từ 2 endpoint riêng theo spec."""
+        params = {"camera_id": self.camera_id}
+        cfg = None
         try:
-            r = httpx.get(
-                f"{self.base_url}/config",
-                params={"device_id": self.camera_id},
-                timeout=3.0,
-            )
+            r = httpx.get(f"{self.base_url}/config/thresholds", params=params, timeout=3.0)
             if r.status_code == 200:
-                resp = ConfigResponse(**r.json())
-                self.current_features = resp.features
-                return resp.thresholds
+                cfg = ThresholdConfig(**r.json())
         except Exception as e:
             self.last_error = str(e)
-        return None
+        try:
+            r = httpx.get(f"{self.base_url}/config/features", params=params, timeout=3.0)
+            if r.status_code == 200:
+                self.current_features = FeatureConfig(**r.json())
+        except Exception as e:
+            self.last_error = str(e)
+        return cfg
 
     def fetch_features_sync(self) -> Optional[FeatureConfig]:
-        """Force-fetch FeatureConfig ngay (không đợi polling 30s)."""
         try:
             r = httpx.get(
-                f"{self.base_url}/config",
-                params={"device_id": self.camera_id},
+                f"{self.base_url}/config/features",
+                params={"camera_id": self.camera_id},
                 timeout=3.0,
             )
             if r.status_code == 200:
-                feat = ConfigResponse(**r.json()).features
-                self.current_features = feat
-                return feat
+                self.current_features = FeatureConfig(**r.json())
+                return self.current_features
         except Exception as e:
             self.last_error = str(e)
         return None
@@ -155,7 +189,9 @@ class BackendClient:
         try:
             r = httpx.get(f"{self.base_url}/family-members", timeout=3.0)
             if r.status_code == 200:
-                return FamilyMembersResponse(**r.json()).members
+                data = r.json()
+                rows = data if isinstance(data, list) else data.get("members", [])
+                return [FamilyMember(**m) for m in rows]
         except Exception as e:
             self.last_error = str(e)
         return []
@@ -163,7 +199,7 @@ class BackendClient:
     def add_family_member_sync(self, payload: AddFamilyMemberPayload) -> bool:
         try:
             r = httpx.post(
-                f"{self.base_url}/family-members",
+                f"{self.base_url}/family-members/register",
                 json=payload.dict(),
                 timeout=3.0,
             )
@@ -206,12 +242,16 @@ class BackendClient:
             FallEvent:             "/events/fall",
             PoseEvent:             "/events/pose",
             PersonDetectedPayload: "/events/person-detected",
+            PatientPoseEvent:      "/events/patient-pose",
+            FaceLogPayload:        "/face-logs",
         }
         while self._running:
             try:
                 event: _AnyEvent = await asyncio.wait_for(
                     self._queue.get(), timeout=1.0
                 )
+                if event is None:   # sentinel từ stop()
+                    break
                 route = _ROUTES.get(type(event))
                 if route:
                     r = await client.post(route, json=event.dict())
@@ -224,38 +264,39 @@ class BackendClient:
                 await asyncio.sleep(0.5)
 
     async def _config_poll_loop(self, client: httpx.AsyncClient):
+        params = {"camera_id": self.camera_id}
         while self._running:
             await asyncio.sleep(self.config_interval)
             try:
-                r = await client.get(
-                    "/config", params={"device_id": self.camera_id}
-                )
+                r = await client.get("/config/thresholds", params=params)
                 if r.status_code == 200:
-                    resp = ConfigResponse(**r.json())
                     self.connected = True
                     if self.on_config_update:
-                        self.on_config_update(resp.thresholds)
-                    if self.on_feature_update:
-                        # Only fire callback when features actually changed
-                        if resp.features != self.current_features:
-                            self.current_features = resp.features
-                            self.on_feature_update(resp.features)
+                        self.on_config_update(ThresholdConfig(**r.json()))
             except Exception as e:
                 self.connected  = False
                 self.last_error = str(e)
+            try:
+                r = await client.get("/config/features", params=params)
+                if r.status_code == 200:
+                    feat = FeatureConfig(**r.json())
+                    if feat != self.current_features:
+                        self.current_features = feat
+                        if self.on_feature_update:
+                            self.on_feature_update(feat)
+            except Exception as e:
+                self.last_error = str(e)
 
-    async def _device_status_loop(self, client: httpx.AsyncClient):
+    async def _heartbeat_loop(self, client: httpx.AsyncClient):
         while self._running:
             await asyncio.sleep(self.status_interval)
-            payload = DeviceStatusPayload(
-                device_id      = self.camera_id,
-                timestamp      = time.time(),
-                status         = DeviceStatusEnum.ONLINE,
-                fps            = self.current_fps,
-                current_pose   = self.current_pose,
-                uptime_seconds = time.time() - self._start_time,
+            payload = HeartbeatPayload(
+                camera_id = self.camera_id,
+                timestamp = time.time(),
+                fps       = self.current_fps,
+                state     = self.current_pose,
             )
             try:
-                await client.post("/device/status", json=payload.dict())
+                await client.post("/events/heartbeat", json=payload.dict())
             except Exception:
                 pass

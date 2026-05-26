@@ -101,12 +101,16 @@ class TransformerEngine:
     def __init__(
         self,
         checkpoint_dir: Optional[str] = None,
-        fall_threshold: float = 0.6,   # P(fall) để kết luận là fall
+        fall_threshold: float = 0.65,   # P(fall) để kết luận là fall
     ):
         self._ckpt_dir = checkpoint_dir or _CKPT_DIR
         self._fall_thr = fall_threshold
 
-        self._device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        import torch
+        print(f"[DEBUG] cuda available: {torch.cuda.is_available()}")
+        print(f"[DEBUG] torch version: {torch.__version__}")
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[DEBUG] device selected: {self._device}")
         self._model:      Optional[_PoseTransformer] = None
         self._num_frames: int                        = 30   # sẽ đọc từ checkpoint
         self._input_dim:  int                        = 200

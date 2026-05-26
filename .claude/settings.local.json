@@ -9,7 +9,12 @@
       "Bash(Select-Object FullName)",
       "Bash(echo \"exit: $?\")",
       "Bash(findstr /V \"tensorflow oneDNN\")",
-      "Bash(set PYTHONIOENCODING=utf-8)"
+      "Bash(set PYTHONIOENCODING=utf-8)",
+      "Bash(Get-ChildItem -Path \"D:\\\\luan_van\\\\Fall-Detection\" -Directory)",
+      "Bash(Select-Object -ExpandProperty Name)",
+      "PowerShell(head *)",
+      "PowerShell(Get-ChildItem -Path \"D:\\\\luan_van\\\\Fall-Detection\" -Force | Where-Object {$_.PSIsContainer} | Select-Object -ExpandProperty FullName)",
+      "Bash(Get-ChildItem -Path \"D:\\\\luan_van\\\\fall-detection-backend\" -Recurse -Depth 2)"
     ]
   }
 }

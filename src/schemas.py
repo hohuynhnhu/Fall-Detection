@@ -8,12 +8,14 @@ from typing import Optional, List
 from enum import Enum
 
 __all__ = [
-    "PoseState", "DeviceStatusEnum", "EventType",
-    "ThresholdConfig", "FeatureConfig", "ConfigResponse",
+    "PoseState", "EventType",
+    "ThresholdConfig", "FeatureConfig",
     "BodyMetricsPayload", "FallEvent", "FallEventResponse",
-    "PoseEvent", "PersonDetectedPayload",
+    "PoseEvent", "PersonDetectedPayload", "PatientPoseEvent",
+    "HeartbeatPayload",
     "FamilyMember", "AddFamilyMemberPayload", "FamilyMembersResponse",
-    "DeviceStatusPayload", "DeviceStatusResponse",
+    "FamilyMemberWithImage", "FamilyMembersAllResponse",
+    "NewMemberWSMessage",
 ]
 
 
@@ -28,17 +30,11 @@ class PoseState(str, Enum):
     UNKNOWN  = "UNKNOWN"
 
 
-class DeviceStatusEnum(str, Enum):
-    ONLINE   = "online"
-    IDLE     = "idle"
-    ERROR    = "error"
-    OFFLINE  = "offline"
-
-
 class EventType(str, Enum):
     FALL             = "fall"
     POSE_CHANGE      = "pose_change"
     PERSON_DETECTED  = "person_detected"
+    PATIENT_POSE     = "patient_pose"
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -46,15 +42,15 @@ class EventType(str, Enum):
 class ThresholdConfig(BaseModel):
     """Ngưỡng phân loại tư thế và phát hiện té ngã — đồng bộ từ backend về."""
     # Pose classification
-    body_angle_lying:        float = Field(65.0,  description="Góc cột sống (°) để coi là nằm")
+    body_angle_lying:        float = Field(75.0,  description="Góc cột sống (°) để coi là nằm")
     body_angle_sitting:      float = Field(45.0,  description="Góc cột sống (°) để coi là ngồi")
-    aspect_ratio_lying:      float = Field(0.55,  description="H/W bbox < ngưỡng → nằm")
+    aspect_ratio_lying:      float = Field(0.45,  description="H/W bbox < ngưỡng → nằm")
     torso_ratio_sitting:     float = Field(0.42,  description="Tỉ lệ torso để phân biệt đứng/ngồi")
     bend_shoulder_drop_threshold: float = 40.0  # px shoulder xuống so với baseline
     bend_hip_max_drop: float = 25.0  # px hip tối đa xuống (nếu lớn hơn → fall)
     # Fall detection
-    fall_velocity_threshold: float = Field(80.0,  description="Vận tốc xuống (px/s) trigger fall")
-    fall_confirm_frames:     int   = Field(5,     description="Số frame LYING liên tiếp để confirm")
+    fall_velocity_threshold: float = Field(150.0,  description="Vận tốc xuống (px/s) trigger fall")
+    fall_confirm_frames:     int   = Field(10,     description="Số frame LYING liên tiếp để confirm")
     fall_history_window:     int   = Field(30,    description="Cửa sổ frame tính velocity")
     # Walking
     walk_velocity_threshold:  float = Field(20.0,  description="Vận tốc ngang (px/s) detect đi")
@@ -75,21 +71,15 @@ class ThresholdConfig(BaseModel):
 
 class FeatureConfig(BaseModel):
     """Feature flags controlled by backend (mobile app) — not local UI state."""
-    enable_face_recognition: bool  = Field(True,  description="Bật/tắt nhận diện khuôn mặt")
-    enable_sound_detection:  bool  = Field(True,  description="Bật/tắt phát hiện âm thanh (YAMNet)")
-    sleep_as_fall:           bool  = Field(False, description="Nằm lâu = té ngã")
-    sound_listen_seconds:    float = Field(3.0, ge=1.0, le=10.0,
-                                           description="Thời gian lắng nghe âm thanh sau khi phát hiện té")
+    enable_face_recognition:        bool  = Field(True,  description="Bật/tắt nhận diện khuôn mặt + đăng ký từ mobile")
+    enable_patient_pose_notification: bool = Field(True,  description="Bật/tắt gửi thông báo tư thế bệnh nhân về mobile")
+    enable_sound_detection:         bool  = Field(True,  description="Bật/tắt phát hiện âm thanh (YAMNet)")
+    sleep_as_fall:                  bool  = Field(False, description="Nằm lâu = té ngã")
+    sound_listen_seconds:           float = Field(3.0, ge=1.0, le=10.0,
+                                                  description="Thời gian lắng nghe âm thanh sau khi phát hiện té")
 
     class Config:
         from_attributes = True
-
-
-class ConfigResponse(BaseModel):
-    """Response body cho GET /config."""
-    device_id:  str             = "cam_0"
-    thresholds: ThresholdConfig = Field(default_factory=ThresholdConfig)
-    features:   FeatureConfig   = Field(default_factory=FeatureConfig)
 
 
 # ── Body Metrics ──────────────────────────────────────────────────────────────
@@ -146,13 +136,10 @@ class PoseEvent(BaseModel):
 
 class PersonDetectedPayload(BaseModel):
     """POST /events/person-detected"""
-    event_type:   EventType = EventType.PERSON_DETECTED
-    camera_id:    str       = "cam_0"
-    timestamp:    float     = 0.0
-    person_id:    str       = "unknown"
-    person_name:  str       = ""
-    confidence:   float     = Field(0.0, ge=0, le=1)
-    frame_id:     int       = 0
+    camera_id:    str   = "cam_0"
+    timestamp:    float = 0.0
+    confidence:   float = Field(0.0, ge=0, le=1)
+    person_count: int   = 1
 
 
 # ── Family Members ────────────────────────────────────────────────────────────
@@ -160,15 +147,18 @@ class PersonDetectedPayload(BaseModel):
 class FamilyMember(BaseModel):
     person_id:    str
     name:         str
-    role:         str = "family"
-    sample_count: int = 0
+    role:         str  = "family"
+    sample_count: int  = 0
+    is_patient:   bool = False
 
 
 class AddFamilyMemberPayload(BaseModel):
-    """POST /family-members"""
-    person_id: str
-    name:      str
-    role:      str = "family"
+    """POST /family-members/register"""
+    person_id:      str
+    name:           str
+    role:           str  = "family"
+    is_patient:     bool = False
+    face_image_url: str  = ""   # URL Cloudinary; rỗng khi đăng ký từ desktop
 
 
 class FamilyMembersResponse(BaseModel):
@@ -176,22 +166,67 @@ class FamilyMembersResponse(BaseModel):
     members: List[FamilyMember] = []
 
 
-# ── Device Status ─────────────────────────────────────────────────────────────
-
-class DeviceStatusPayload(BaseModel):
-    """POST /device/status"""
-    device_id:      str              = "cam_0"
-    timestamp:      float            = 0.0
-    status:         DeviceStatusEnum = DeviceStatusEnum.ONLINE
-    fps:            float            = Field(0.0, ge=0)
-    current_pose:   PoseState        = PoseState.UNKNOWN
-    uptime_seconds: float            = Field(0.0, ge=0)
-    error_message:  Optional[str]    = None
+class FamilyMemberWithImage(BaseModel):
+    """GET /family-members/all — kèm URL ảnh khuôn mặt để desktop download + encode."""
+    person_id:      str
+    name:           str
+    role:           str  = "family"
+    is_patient:     bool = False
+    face_image_url: str  = ""   # URL backend lưu ảnh gốc từ mobile
 
 
-class DeviceStatusResponse(BaseModel):
-    received:  bool  = True
-    timestamp: float = 0.0
+class FamilyMembersAllResponse(BaseModel):
+    """GET /family-members/all"""
+    members: List[FamilyMemberWithImage] = []
+
+
+# ── Heartbeat ─────────────────────────────────────────────────────────────────
+
+class HeartbeatPayload(BaseModel):
+    """POST /events/heartbeat"""
+    camera_id: str       = "cam_0"
+    timestamp: float     = 0.0
+    fps:       float     = Field(0.0, ge=0)
+    state:     PoseState = PoseState.UNKNOWN
+
+
+# ── Patient Pose Event ────────────────────────────────────────────────────────
+
+class PatientPoseEvent(BaseModel):
+    """POST /events/patient-pose — Thông báo tư thế bệnh nhân theo thời gian thực."""
+    event_type:   EventType              = EventType.PATIENT_POSE
+    camera_id:    str                    = "cam_0"
+    timestamp:    float                  = 0.0
+    person_id:    str                    = ""
+    person_name:  str                    = ""
+    state:        PoseState              = PoseState.UNKNOWN
+    prev_state:   PoseState              = PoseState.UNKNOWN
+    metrics:      Optional[BodyMetricsPayload] = None
+    frame_id:     int                    = 0
+
+
+# ── WebSocket push từ backend ─────────────────────────────────────────────────
+
+class NewMemberWSMessage(BaseModel):
+    """Backend push qua WebSocket /ws/desktop khi mobile đăng ký thành viên mới."""
+    type:               str  = "new_member"
+    person_id:          str  = ""
+    name:               str  = ""
+    role:               str  = "family"
+    is_patient:         bool = False
+    face_image_base64:  str  = ""   # JPEG bytes encode base64
+
+
+# ── Face Recognition Log ──────────────────────────────────────────────────────
+
+class FaceLogPayload(BaseModel):
+    """POST /face-logs — gửi sau mỗi lần nhận diện khuôn mặt thành công."""
+    person_id:     str
+    name:          str
+    is_patient:    bool  = False
+    confidence:    float = Field(0.0, ge=0.0, le=1.0)
+    camera_id:     str   = "cam_0"
+    recognized_at: float = 0.0   # unix timestamp; 0 → backend dùng server time
 
 
 # ── Legacy aliases (backward compat) ─────────────────────────────────────────
