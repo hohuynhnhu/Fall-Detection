@@ -129,11 +129,10 @@ class MediaPipeExtractor:
         ), res.pose_landmarks, mp_raw
 
     def draw(self, frame, landmarks, color=(80, 220, 80)):
-        lm_spec   = self._draw.DrawingSpec(color=color, thickness=3, circle_radius=5)
-        conn_spec = self._draw.DrawingSpec(
-            color=tuple(min(c + 40, 255) for c in color), thickness=2)
+        # Chỉ vẽ keypoint dots, không vẽ đường kết nối
+        lm_spec = self._draw.DrawingSpec(color=color, thickness=-1, circle_radius=4)
         self._draw.draw_landmarks(
-            frame, landmarks, self._mp.POSE_CONNECTIONS, lm_spec, conn_spec)
+            frame, landmarks, None, lm_spec, lm_spec)
 
     def close(self):
         self.pose.close()

@@ -313,7 +313,8 @@ class FallDetector:
                 f"fast_down={fast_down} | upright_before_fall={upright_before_fall}"
             )
 
-        if fast_down and was_up and now_lying and not too_slow and not bending and upright_before_fall:
+        # if fast_down and was_up and now_lying and not too_slow and not bending and upright_before_fall:
+        if fast_down and was_up and now_lying and not bending and upright_before_fall:
             self.confirmed = True
             self.start_time = now
             self.events.append({

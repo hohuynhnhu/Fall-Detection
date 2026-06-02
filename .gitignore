@@ -14,3 +14,4 @@ data
 **/dataset_1/
 .env
 clips/
+train_tranformer/

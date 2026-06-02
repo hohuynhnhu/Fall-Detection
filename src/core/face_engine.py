@@ -53,13 +53,14 @@ class FaceBox:
 
 @dataclass
 class RecognizedPerson:
-    person_id:  str
-    name:       str
-    confidence: float   # 0–1, cao hơn = chắc hơn
-    box:        FaceBox
-    is_known:   bool = False
-    is_patient: bool = False
-    track_id:   int  = -1
+    person_id:      str
+    name:           str
+    confidence:     float   # 0–1, cao hơn = chắc hơn
+    box:            FaceBox
+    is_known:       bool = False
+    is_patient:     bool = False
+    track_id:       int  = -1
+    notify_on_fall: bool = True   # False → nhận ra nhưng không gửi cảnh báo
 
 
 class FaceDatabase:
@@ -160,7 +161,7 @@ class FaceEngine:
 
         # Per-track attempt counters for process_frame()
         self._track_attempts: Dict[int, int] = {}
-        self._MAX_ATTEMPTS = 10
+        self._MAX_ATTEMPTS = 30   # ~5s @ 30fps thay vì 1.7s
 
     def set_family_manager(self, fm) -> None:
         """Inject FamilyManager — _match() will use network gallery instead of local DB."""
@@ -360,23 +361,26 @@ class FaceEngine:
         box:       FaceBox,
         track_id:  int = -1,
     ) -> RecognizedPerson:
-        # Priority: FamilyManager (network-backed gallery from backend)
-        if self._family_manager is not None:
+        # Priority 1: FamilyManager (network-backed gallery from backend)
+        if self._family_manager is not None and self._family_manager.member_count() > 0:
             result = self._family_manager.match_person(embedding)
             if result:
                 return RecognizedPerson(
-                    person_id  = result["person_id"],
-                    name       = result["name"],
-                    confidence = result["confidence"],
-                    box        = box,
-                    is_known   = True,
-                    is_patient = result["is_patient"],
-                    track_id   = track_id,
+                    person_id      = result["person_id"],
+                    name           = result["name"],
+                    confidence     = result["confidence"],
+                    box            = box,
+                    is_known       = True,
+                    is_patient     = result["is_patient"],
+                    notify_on_fall = result.get("notify_on_fall", True),
+                    track_id       = track_id,
                 )
+            # FamilyManager có thành viên nhưng không khớp ai
+            # → KHÔNG fallback local DB (tránh nhận nhầm từ dữ liệu test cũ)
             return RecognizedPerson(
                 "unknown", "Không nhận ra", 0.0, box, False, False, track_id)
 
-        # Fallback: local pickle DB (enrolled via desktop UI)
+        # Fallback: local pickle DB — chỉ dùng khi FamilyManager KHÔNG có thành viên nào
         best_id    = "unknown"
         best_name  = "Không nhận ra"
         best_score = -1.0

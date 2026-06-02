@@ -129,6 +129,7 @@ class TrackerManager:
                 "person_id":       person_id,
                 "name":            name,
                 "is_patient":      is_patient,
+                "notify_on_fall":  True,
                 "snapshot":        snapshot,
                 "last_seen_frame": cur_frame,
                 "last_box":        box,
@@ -137,18 +138,20 @@ class TrackerManager:
 
     def update_track_identity(
         self,
-        track_id:   int,
-        person_id:  str,
-        name:       str,
-        is_patient: bool,
+        track_id:       int,
+        person_id:      str,
+        name:           str,
+        is_patient:     bool,
+        notify_on_fall: bool = True,
     ) -> None:
         """Set recognized identity after face recognition succeeds."""
         with self._lock:
             if track_id in self._tracks:
                 t = self._tracks[track_id]
-                t["person_id"]  = person_id
-                t["name"]       = name
-                t["is_patient"] = is_patient
+                t["person_id"]      = person_id
+                t["name"]           = name
+                t["is_patient"]     = is_patient
+                t["notify_on_fall"] = notify_on_fall
 
     def update_last_box(self, track_id: int, box: tuple, cur_frame: int) -> None:
         with self._lock:

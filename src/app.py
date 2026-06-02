@@ -10,6 +10,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
+import tkinter.filedialog as fd
+from pathlib import Path
 import cv2
 import queue
 import time
@@ -18,198 +20,17 @@ from PIL import Image, ImageTk
 
 from core.camera_worker import CameraWorker, WorkerFrame
 from core.overlay import OverlayRenderer, STATE_LABELS_VN, STATE_SKELETON_COLORS
+from core.fall_decision import FallDecisionEngine
 from services.backend_client import BackendClient
+from utils.beep_manager import BeepManager
 from schemas import (
     ThresholdConfig, FeatureConfig, FallEvent, PoseEvent,
     PoseState, EventType, BodyMetricsPayload,
     PersonDetectedPayload, AddFamilyMemberPayload, PatientPoseEvent,
 )
 
-# ─── Theme ─────────────────────────────────────────────────────────────────────
-
-T = {
-    "bg"    : "#0c0c1a", "panel" : "#151525", "card"  : "#1c1c30",
-    "border": "#28284a", "accent": "#4a9eff", "danger": "#ff3b3b",
-    "ok"    : "#3bff8a", "warn"  : "#ffaa22", "text"  : "#e0e0f0",
-    "sub"   : "#6868a0", "stand" : "#3bff8a", "sit"   : "#4a9eff",
-    "lie"   : "#ffaa22", "walk"  : "#b464ff", "fall"  : "#ff3b3b",
-    "face"  : "#50f0c0",
-}
-STATE_COLOR_TK = {
-    PoseState.STANDING: T["stand"], PoseState.SITTING: T["sit"],
-    PoseState.LYING   : T["lie"],   PoseState.WALKING: T["walk"],
-    PoseState.FALLING : T["fall"],  PoseState.UNKNOWN: T["sub"],
-}
-
-
-def _beep_fall():
-    """Phát 3 tiếng beep cảnh báo trong thread riêng (không block UI)."""
-    def _play():
-        try:
-            import winsound
-            for _ in range(3):
-                winsound.Beep(1000, 200)
-        except Exception:
-            pass
-    threading.Thread(target=_play, daemon=True).start()
-
-
-def _card(parent, title="", pady=8):
-    f = tk.Frame(parent, bg=T["card"],
-                 highlightbackground=T["border"], highlightthickness=1)
-    f.pack(fill="x", pady=(0, pady))
-    if title:
-        tk.Label(f, text=title.upper(), font=("Courier New", 8, "bold"),
-                 fg=T["sub"], bg=T["card"], anchor="w").pack(fill="x", padx=12, pady=(8, 2))
-    inner = tk.Frame(f, bg=T["card"])
-    inner.pack(fill="x", padx=12, pady=(0, 10))
-    return inner
-
-def _btn(parent, text, cmd, bg=None, fg="#000", **kw):
-    return tk.Button(parent, text=text, command=cmd,
-                     font=("Courier New", 10, "bold"), fg=fg,
-                     bg=bg or T["border"], activebackground=T["panel"],
-                     relief="flat", cursor="hand2", padx=8, pady=6, **kw)
-
-
-# ─── Helpers ───────────────────────────────────────────────────────────────────
-
-def _face_center_in_bbox(face_box, person_bbox: tuple) -> bool:
-    """Kiểm tra tâm khuôn mặt có nằm trong bounding box người không."""
-    cx = (face_box.x1 + face_box.x2) // 2
-    cy = (face_box.y1 + face_box.y2) // 2
-    x1, y1, x2, y2 = person_bbox
-    return x1 <= cx <= x2 and y1 <= cy <= y2
-
-
-# ─── Family Management Window ───────────────────────────────────────────────────
-
-class FamilyManagementWindow(tk.Toplevel):
-    """Cửa sổ quản lý thành viên gia đình (thêm / xóa)."""
-
-    def __init__(self, parent_app: "FallDetectionApp"):
-        super().__init__(parent_app.root)
-        self._app = parent_app
-        self.title("Quản lý thành viên gia đình")
-        self.configure(bg=T["bg"])
-        self.geometry("480x520")
-        self.resizable(False, False)
-        self._build()
-        self._refresh()
-
-    def _build(self):
-        tk.Label(self, text="THÀNH VIÊN GIA ĐÌNH",
-                 font=("Courier New", 13, "bold"), fg=T["accent"], bg=T["bg"]
-                 ).pack(pady=(14, 6))
-
-        # List frame
-        lf = tk.Frame(self, bg=T["card"],
-                      highlightbackground=T["border"], highlightthickness=1)
-        lf.pack(fill="both", expand=True, padx=16, pady=6)
-
-        cols = ("Tên", "Vai trò", "Bệnh nhân", "Mẫu", "ID")
-        self._tree = ttk.Treeview(lf, columns=cols, show="headings", height=14)
-        col_widths = {"Tên": 110, "Vai trò": 80, "Bệnh nhân": 70, "Mẫu": 50, "ID": 70}
-        for c in cols:
-            self._tree.heading(c, text=c)
-            self._tree.column(c, width=col_widths.get(c, 80), anchor="center")
-        self._tree.pack(side="left", fill="both", expand=True)
-        sb = tk.Scrollbar(lf, command=self._tree.yview)
-        sb.pack(side="right", fill="y")
-        self._tree.configure(yscrollcommand=sb.set)
-
-        # Buttons
-        bf = tk.Frame(self, bg=T["bg"])
-        bf.pack(fill="x", padx=16, pady=10)
-        _btn(bf, "＋ Thêm thành viên",  self._add,    bg=T["ok"],    fg="#000").pack(side="left", padx=4)
-        _btn(bf, "✕ Xóa đã chọn",       self._delete, bg=T["danger"], fg="#fff").pack(side="left", padx=4)
-        _btn(bf, "↺ Làm mới",            self._refresh, fg=T["text"]).pack(side="right", padx=4)
-
-        # Status
-        self._status = tk.Label(self, text="", font=("Courier New", 8),
-                                fg=T["sub"], bg=T["bg"])
-        self._status.pack(pady=(0, 8))
-
-    def _refresh(self):
-        for row in self._tree.get_children():
-            self._tree.delete(row)
-        members = []
-        if self._app._worker and self._app._worker._face_engine:
-            members = self._app._worker._face_engine.list_members()
-        for m in members:
-            patient_mark = "✓" if m.get("is_patient") else ""
-            self._tree.insert("", "end", values=(
-                m["name"], m["role"], patient_mark,
-                m["sample_count"], m["person_id"],
-            ))
-        self._status.config(text=f"{len(members)} thành viên trong database")
-
-    def _add(self):
-        frame = self._app._last_frame_bgr
-        if frame is None:
-            messagebox.showwarning("Chưa có camera",
-                                   "Bấm BẮT ĐẦU trước, sau đó thêm thành viên.", parent=self)
-            return
-
-        fe = self._app._worker._face_engine if self._app._worker else None
-        if fe is None:
-            messagebox.showwarning("Nhận diện khuôn mặt chưa bật",
-                                   "Bật checkbox 'Nhận diện khuôn mặt' trước.", parent=self)
-            return
-
-        name = simpledialog.askstring("Tên thành viên", "Nhập tên:", parent=self)
-        if not name:
-            return
-        role = simpledialog.askstring("Vai trò", "Vai trò (family / caregiver):",
-                                      initialvalue="family", parent=self) or "family"
-        is_patient = messagebox.askyesno(
-            "Bệnh nhân",
-            f"'{name.strip()}' có phải bệnh nhân cần theo dõi tư thế không?\n\n"
-            "• Có  → hệ thống sẽ gửi thông báo trạng thái (đứng/ngồi/nằm/đi) về mobile\n"
-            "• Không → chỉ nhận diện danh tính bình thường",
-            parent=self,
-        )
-
-        pid = fe.enroll(frame, name=name.strip(), role=role.strip(), is_patient=is_patient)
-        if pid is None:
-            messagebox.showerror("Không phát hiện khuôn mặt",
-                                 "Không thấy khuôn mặt trong frame hiện tại.\n"
-                                 "Hãy đứng trước camera rồi thử lại.", parent=self)
-            return
-
-        # Đồng bộ vào FamilyManager (in-memory dict) nếu đang active
-        fm = self._app._family_manager
-        if fm is not None:
-            enc = fe.db.members[pid]["encodings"][-1]
-            fm.add_encoding(pid, name.strip(), is_patient, enc)
-
-        # Sync metadata lên backend (không bắt buộc — bỏ qua nếu offline)
-        payload = AddFamilyMemberPayload(
-            person_id=pid, name=name.strip(), role=role.strip(), is_patient=is_patient)
-        ok = self._app._backend.add_family_member_sync(payload)
-        suffix = "" if ok else " (backend offline — lưu local)"
-        patient_note = " [BỆNH NHÂN]" if is_patient else ""
-        messagebox.showinfo("Thành công",
-                            f"Đã thêm '{name}'{patient_note} (ID: {pid}){suffix}", parent=self)
-        self._refresh()
-
-    def _delete(self):
-        sel = self._tree.selection()
-        if not sel:
-            return
-        values = self._tree.item(sel[0], "values")
-        pid, name = values[4], values[0]
-        if not messagebox.askyesno("Xác nhận", f"Xóa '{name}' khỏi database?", parent=self):
-            return
-
-        fe = self._app._worker._face_engine if self._app._worker else None
-        if fe:
-            fe.remove_member(pid)
-        if self._app._family_manager:
-            self._app._family_manager.remove(pid)
-        self._app._backend.remove_family_member_sync(pid)
-        self._refresh()
-
+from ui.theme import T, STATE_COLOR_TK, make_card, make_btn, face_center_in_bbox
+from ui.family_window import FamilyManagementWindow
 
 # ─── App ───────────────────────────────────────────────────────────────────────
 
@@ -222,6 +43,7 @@ class FallDetectionApp:
         self.root.minsize(1100, 680)
 
         self._running       = False
+        self._video_source: "int | str" = 0   # 0 = webcam, str = video file path
         self._worker: CameraWorker | None      = None
         self._renderer: OverlayRenderer | None = None
         self._queue: queue.Queue               = queue.Queue(maxsize=3)
@@ -232,9 +54,8 @@ class FallDetectionApp:
         self._thresh_vars: dict  = {}
         self._last_frame_bgr     = None  # dùng cho enrollment
         self._trans_fall_logged  = False  # debounce AI fall log
-        self._last_beep_t        = 0.0   # cooldown beep 3s
-        self._lying_start_t      = 0.0   # track lying start for AI confirm logic
-        self._non_lying_streak   = 0     # frame đứng liên tiếp, dùng để reset _lying_start_t
+        self._fall_engine        = FallDecisionEngine()
+        self._beep               = BeepManager()
         # Debounce gửi person-detected: {person_id: last_sent_time}
         self._person_sent_at: dict[str, float] = {}
 
@@ -258,179 +79,163 @@ class FallDetectionApp:
     # ── Build UI ───────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # ── Header bar ────────────────────────────────────────────────────
-        hdr = tk.Frame(self.root, bg="#080816", height=48)
+        self.root.state("zoomed")   # Phóng to toàn màn hình
+
+        # ── Header (40px) ────────────────────────────────────────────────
+        hdr = tk.Frame(self.root, bg="#07071a", height=40)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
-        tk.Frame(hdr, bg=T["accent"], width=4).pack(side="left", fill="y")
+        tk.Frame(hdr, bg=T["accent"], width=3).pack(side="left", fill="y")
         tk.Label(hdr, text="  FALL DETECTION SYSTEM",
-                 font=("Courier New", 15, "bold"), fg=T["accent"], bg="#080816"
-                 ).pack(side="left", padx=(6, 0), pady=10)
-        tk.Label(hdr, text="MediaPipe · YOLO · Transformer AI · Face ID · YAMNet Audio",
-                 font=("Courier New", 8), fg=T["sub"], bg="#080816"
-                 ).pack(side="left", padx=14)
+                 font=("Courier New", 13, "bold"), fg=T["accent"], bg="#07071a"
+                 ).pack(side="left", padx=(6, 0))
+        tk.Label(hdr, text="  —  MediaPipe · YOLO · Transformer AI · Face ID · YAMNet",
+                 font=("Courier New", 8), fg=T["sub"], bg="#07071a"
+                 ).pack(side="left")
         self._dot = tk.Label(hdr, text="● OFFLINE",
-                              font=("Courier New", 9, "bold"), fg=T["danger"], bg="#080816")
-        self._dot.pack(side="right", padx=16)
+                             font=("Courier New", 9, "bold"), fg=T["danger"], bg="#07071a")
+        self._dot.pack(side="right", padx=14)
+        self._time_lbl = tk.Label(hdr, text="",
+                                  font=("Courier New", 9), fg=T["sub"], bg="#07071a")
+        self._time_lbl.pack(side="right", padx=8)
 
         # ── Body ──────────────────────────────────────────────────────────
-        body = tk.Frame(self.root, bg=T["bg"])
-        body.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+        body = tk.Frame(self.root, bg="#000")
+        body.pack(fill="both", expand=True)
 
-        # Right panel (fixed width, scrollable)
-        panel_outer = tk.Frame(body, bg=T["bg"], width=330)
-        panel_outer.pack(side="right", fill="y", padx=(10, 0))
-        panel_outer.pack_propagate(False)
+        # Camera feed (trái, chiếm toàn bộ không gian còn lại)
+        self._cam = tk.Label(body, bg="#050510",
+                             text="Camera chưa khởi động\nBấm  ▶ BẮT ĐẦU",
+                             fg=T["sub"], font=("Courier New", 14))
+        self._cam.pack(side="left", fill="both", expand=True)
 
-        canvas = tk.Canvas(panel_outer, bg=T["bg"], highlightthickness=0)
-        vsb    = tk.Scrollbar(panel_outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        inner = tk.Frame(canvas, bg=T["bg"])
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        # Right panel (cố định 280px, không cuộn)
+        panel = tk.Frame(body, bg=T["panel"], width=280)
+        panel.pack(side="right", fill="y")
+        panel.pack_propagate(False)
 
-        # Camera feed
-        cam_border = tk.Frame(body, bg=T["border"])
-        cam_border.pack(side="left", fill="both", expand=True)
-        self._cam = tk.Label(cam_border, bg="#050510",
-                              text="Camera chưa khởi động\nBấm  ▶ BẮT ĐẦU",
-                              fg=T["sub"], font=("Courier New", 13))
-        self._cam.pack(fill="both", expand=True, padx=1, pady=1)
-
-        self._build_panel(inner)
+        self._build_panel(panel)
 
     def _build_panel(self, panel):
-        # ── 1. ĐIỀU KHIỂN ────────────────────────────────────────────────
-        ctrl = _card(panel, "ĐIỀU KHIỂN", pady=6)
+        BG = T["panel"]
 
-        # 3 buttons side by side
-        br = tk.Frame(ctrl, bg=T["card"]); br.pack(fill="x", pady=(0, 8))
-        self._btn_start = _btn(br, "▶  BẮT ĐẦU", self._start, bg=T["ok"])
+        def _sep():
+            tk.Frame(panel, bg=T["border"], height=1).pack(fill="x")
+
+        def _section(title):
+            f = tk.Frame(panel, bg=BG)
+            f.pack(fill="x", padx=14, pady=(10, 6))
+            if title:
+                tk.Label(f, text=title, font=("Courier New", 7, "bold"),
+                         fg=T["sub"], bg=BG, anchor="w").pack(fill="x", pady=(0, 4))
+            return f
+
+        # ── 1. ĐIỀU KHIỂN ────────────────────────────────────────────────
+        ctrl = _section("ĐIỀU KHIỂN")
+        br = tk.Frame(ctrl, bg=BG); br.pack(fill="x", pady=(0, 4))
+        self._btn_start = make_btn(br, "▶  BẮT ĐẦU", self._start, bg=T["ok"])
         self._btn_start.pack(side="left", fill="x", expand=True, padx=(0, 3))
-        self._btn_stop = _btn(br, "■  DỪNG", self._stop, fg=T["text"])
+        self._btn_stop = make_btn(br, "■  DỪNG", self._stop, fg=T["text"])
         self._btn_stop.pack(side="left", fill="x", expand=True, padx=(0, 3))
         self._btn_stop.config(state="disabled")
-        _btn(br, "↺  RESET", self._reset_falls, fg=T["text"]).pack(side="left", fill="x", expand=True)
+        make_btn(br, "↺", self._reset_falls, fg=T["text"]).pack(side="left")
 
+        src_row = tk.Frame(ctrl, bg=BG); src_row.pack(fill="x", pady=(0, 6))
+        make_btn(src_row, "📂 Chọn video", self._pick_video, fg=T["text"]).pack(
+            side="left", fill="x", expand=True, padx=(0, 3))
+        make_btn(src_row, "📷 Webcam", self._set_webcam, fg=T["text"]).pack(
+            side="left", fill="x", expand=True)
 
-        # Checkboxes
-        cr = tk.Frame(ctrl, bg=T["card"]); cr.pack(fill="x", pady=(6, 4))
-        self._yolo_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(cr, text="YOLO", variable=self._yolo_var,
-                       bg=T["card"], fg=T["sub"], selectcolor=T["panel"],
-                       font=("Courier New", 9)).pack(side="left")
-        self._face_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(cr, text="Face ID", variable=self._face_var,
-                       bg=T["card"], fg=T["face"], selectcolor=T["panel"],
-                       font=("Courier New", 9)).pack(side="left", padx=8)
-        self._transformer_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(cr, text="AI", variable=self._transformer_var,
-                       bg=T["card"], fg="#ff9f40", selectcolor=T["panel"],
-                       font=("Courier New", 9)).pack(side="left")
+        # Badges: YOLO · AI · Face (tự động, chỉ hiển thị)
+        badge_row = tk.Frame(ctrl, bg=BG); badge_row.pack(fill="x", pady=(0, 6))
+        self._badge_yolo  = tk.Label(badge_row, text="● YOLO",  font=("Courier New", 8, "bold"),
+                                     fg=T["sub"], bg=BG)
+        self._badge_yolo.pack(side="left", padx=(0, 6))
+        self._badge_ai    = tk.Label(badge_row, text="● AI",    font=("Courier New", 8, "bold"),
+                                     fg=T["sub"], bg=BG)
+        self._badge_ai.pack(side="left", padx=(0, 6))
+        self._badge_face  = tk.Label(badge_row, text="● FACE",  font=("Courier New", 8, "bold"),
+                                     fg=T["sub"], bg=BG)
+        self._badge_face.pack(side="left")
 
-        # Backend API URL
-        ur = tk.Frame(ctrl, bg=T["card"]); ur.pack(fill="x")
-        tk.Label(ur, text="API:", fg=T["sub"], bg=T["card"],
-                 font=("Courier New", 8), width=7, anchor="w").pack(side="left")
+        ur = tk.Frame(ctrl, bg=BG); ur.pack(fill="x")
+        tk.Label(ur, text="API:", fg=T["sub"], bg=BG,
+                 font=("Courier New", 8), width=5, anchor="w").pack(side="left")
         self._url_var = tk.StringVar(value="http://localhost:8000")
-        tk.Entry(ur, textvariable=self._url_var,
-                 bg=T["panel"], fg=T["text"], insertbackground=T["text"],
-                 relief="flat", font=("Courier New", 8)
+        tk.Entry(ur, textvariable=self._url_var, bg=T["card"], fg=T["text"],
+                 insertbackground=T["text"], relief="flat", font=("Courier New", 8), bd=4
                  ).pack(side="left", fill="x", expand=True)
 
+        _sep()
+
         # ── 2. TRẠNG THÁI + AI ───────────────────────────────────────────
-        sc = _card(panel, "TRẠNG THÁI", pady=6)
-        st_row = tk.Frame(sc, bg=T["card"]); st_row.pack(fill="x")
+        sc = _section("TRẠNG THÁI")
+        row = tk.Frame(sc, bg=BG); row.pack(fill="x")
+        self._state_lbl = tk.Label(row, text="---",
+            font=("Courier New", 28, "bold"), fg=T["sub"], bg=BG, anchor="w")
+        self._state_lbl.pack(side="left")
 
-        # Left: rule-based state
-        left_col = tk.Frame(st_row, bg=T["card"])
-        left_col.pack(side="left", fill="both", expand=True)
-        self._state_lbl = tk.Label(left_col, text="---",
-            font=("Courier New", 27, "bold"), fg=T["sub"], bg=T["card"], anchor="w")
-        self._state_lbl.pack(fill="x")
-        self._conf_lbl = tk.Label(left_col, text="Confidence: —",
-            font=("Courier New", 8), fg=T["sub"], bg=T["card"], anchor="w")
-        self._conf_lbl.pack(fill="x")
-
-        # Divider
-        tk.Frame(st_row, bg=T["border"], width=1).pack(side="left", fill="y", padx=8)
-
-        # Right: transformer AI
-        right_col = tk.Frame(st_row, bg=T["card"])
-        right_col.pack(side="right", anchor="n")
-        tk.Label(right_col, text="AI Transformer", font=("Courier New", 7, "bold"),
-                 fg="#ff9f40", bg=T["card"]).pack(anchor="e")
-        self._ai_lbl = tk.Label(right_col, text="—",
-            font=("Courier New", 11, "bold"), fg=T["sub"], bg=T["card"])
+        ai_col = tk.Frame(row, bg=BG); ai_col.pack(side="right", anchor="s", pady=2)
+        tk.Label(ai_col, text="AI", font=("Courier New", 7, "bold"),
+                 fg="#ff9f40", bg=BG).pack(anchor="e")
+        self._ai_lbl = tk.Label(ai_col, text="—",
+            font=("Courier New", 11, "bold"), fg=T["sub"], bg=BG)
         self._ai_lbl.pack(anchor="e")
-        self._ai_buf = tk.Label(right_col, text="",
-            font=("Courier New", 7), fg=T["sub"], bg=T["card"])
+        self._ai_buf = tk.Label(ai_col, text="",
+            font=("Courier New", 7), fg=T["sub"], bg=BG)
         self._ai_buf.pack(anchor="e")
 
+        self._conf_lbl = tk.Label(sc, text="Confidence: —",
+            font=("Courier New", 8), fg=T["sub"], bg=BG, anchor="w")
+        self._conf_lbl.pack(fill="x")
+
+        _sep()
+
         # ── 3. CẢNH BÁO TÉ NGÃ ──────────────────────────────────────────
-        ac = _card(panel, "CẢNH BÁO TÉ NGÃ", pady=6)
+        ac = _section("CẢNH BÁO TÉ NGÃ")
         self._alert_lbl = tk.Label(ac, text="CHƯA PHÁT HIỆN",
-            font=("Courier New", 14, "bold"), fg=T["ok"], bg=T["card"])
-        self._alert_lbl.pack(pady=(2, 0))
+            font=("Courier New", 13, "bold"), fg=T["ok"], bg=BG, anchor="w")
+        self._alert_lbl.pack(fill="x")
         self._fall_src_lbl = tk.Label(ac, text="",
-            font=("Courier New", 7), fg=T["sub"], bg=T["card"])
-        self._fall_src_lbl.pack()
+            font=("Courier New", 7), fg=T["sub"], bg=BG, anchor="w")
+        self._fall_src_lbl.pack(fill="x")
         self._fall_cnt = tk.Label(ac, text="Số lần té: 0",
-            font=("Courier New", 9), fg=T["text"], bg=T["card"])
-        self._fall_cnt.pack(pady=(2, 0))
+            font=("Courier New", 8), fg=T["text"], bg=BG, anchor="w")
+        self._fall_cnt.pack(fill="x")
 
-        # ── 4. ÂM THANH (YAMNet) ────────────────────────────────────────────
-        au = _card(panel, "ÂM THANH (YAMNet)", pady=6)
-        # Row 1: status + API badge
-        au_row1 = tk.Frame(au, bg=T["card"]); au_row1.pack(fill="x")
-        self._audio_status_lbl = tk.Label(au_row1, text="KHÔNG KHẢ DỤNG",
-            font=("Courier New", 11, "bold"), fg=T["sub"], bg=T["card"], anchor="w")
-        self._audio_status_lbl.pack(side="left")
-        self._audio_api_badge = tk.Label(au_row1, text="[API: —]",
-            font=("Courier New", 7), fg=T["sub"], bg=T["card"], anchor="e")
-        self._audio_api_badge.pack(side="right")
-        # Row 2: detected sound class + confidence
-        self._audio_class_lbl = tk.Label(au, text="",
-            font=("Courier New", 8), fg=T["sub"], bg=T["card"], anchor="w")
-        self._audio_class_lbl.pack(fill="x")
-        self._audio_conf_lbl = tk.Label(au, text="",
-            font=("Courier New", 8), fg=T["sub"], bg=T["card"], anchor="w")
-        self._audio_conf_lbl.pack(fill="x")
+        _sep()
 
-        # ── 5. NHẬN DIỆN KHUÔN MẶT ──────────────────────────────────────
-        fc = _card(panel, "NHẬN DIỆN KHUÔN MẶT", pady=6)
-        # Face header row with API badge
-        fc_row1 = tk.Frame(fc, bg=T["card"]); fc_row1.pack(fill="x")
-        self._face_name_lbl = tk.Label(fc_row1, text="Chưa phát hiện",
-            font=("Courier New", 12, "bold"), fg=T["sub"], bg=T["card"], anchor="w")
+        # ── 4. NHẬN DIỆN KHUÔN MẶT ──────────────────────────────────────
+        fc = _section("NHẬN DIỆN KHUÔN MẶT")
+        fc_hdr = tk.Frame(fc, bg=BG); fc_hdr.pack(fill="x")
+        self._face_name_lbl = tk.Label(fc_hdr, text="Chưa phát hiện",
+            font=("Courier New", 12, "bold"), fg=T["sub"], bg=BG, anchor="w")
         self._face_name_lbl.pack(side="left")
-        self._face_api_badge = tk.Label(fc_row1, text="[API: —]",
-            font=("Courier New", 7), fg=T["sub"], bg=T["card"], anchor="e")
+        self._face_api_badge = tk.Label(fc_hdr, text="[API: —]",
+            font=("Courier New", 7), fg=T["sub"], bg=BG)
         self._face_api_badge.pack(side="right")
         self._face_conf_lbl = tk.Label(fc, text="",
-            font=("Courier New", 8), fg=T["sub"], bg=T["card"])
-        self._face_conf_lbl.pack()
-        _btn(fc, "👥 Quản lý thành viên", self._open_family_mgmt,
-             fg=T["text"], bg=T["border"]).pack(fill="x", pady=(6, 0))
+            font=("Courier New", 8), fg=T["sub"], bg=BG, anchor="w")
+        self._face_conf_lbl.pack(fill="x")
+        self._face_status_lbl = tk.Label(fc, text="⚙ Chờ khởi động...",
+            font=("Courier New", 7), fg=T["sub"], bg=BG, anchor="w")
+        self._face_status_lbl.pack(fill="x")
 
-        # ── 6. BỆNH NHÂN THEO DÕI ───────────────────────────────────────
-        pc = _card(panel, "BỆNH NHÂN THEO DÕI", pady=6)
-        pt_row1 = tk.Frame(pc, bg=T["card"]); pt_row1.pack(fill="x")
-        tk.Label(pt_row1, text="Thông báo tư thế",
-                 font=("Courier New", 8), fg=T["sub"], bg=T["card"], anchor="w"
-                 ).pack(side="left")
-        self._patient_notify_badge = tk.Label(pt_row1, text="[API: —]",
-            font=("Courier New", 7), fg=T["sub"], bg=T["card"], anchor="e")
+        _sep()
+
+        # ── 5. BỆNH NHÂN THEO DÕI ───────────────────────────────────────
+        pc = _section("BỆNH NHÂN THEO DÕI")
+        pc_hdr = tk.Frame(pc, bg=BG); pc_hdr.pack(fill="x")
+        tk.Label(pc_hdr, text="Thông báo tư thế",
+                 font=("Courier New", 8), fg=T["sub"], bg=BG, anchor="w").pack(side="left")
+        self._patient_notify_badge = tk.Label(pc_hdr, text="[API: —]",
+            font=("Courier New", 7), fg=T["sub"], bg=BG)
         self._patient_notify_badge.pack(side="right")
         self._patient_text = tk.Text(
-            pc, height=4, bg=T["panel"], fg=T["text"],
-            font=("Courier New", 8), relief="flat",
-            state="disabled", wrap="none",
+            pc, height=3, bg=T["card"], fg=T["text"],
+            font=("Courier New", 8), relief="flat", state="disabled", wrap="none",
         )
-        self._patient_text.pack(fill="x")
+        self._patient_text.pack(fill="x", pady=(4, 0))
         self._patient_text.tag_configure("stand", foreground=T["stand"])
         self._patient_text.tag_configure("sit",   foreground=T["sit"])
         self._patient_text.tag_configure("lie",   foreground=T["lie"])
@@ -438,57 +243,68 @@ class FallDetectionApp:
         self._patient_text.tag_configure("fall",  foreground=T["fall"])
         self._patient_text.tag_configure("dim",   foreground=T["sub"])
 
-        # ── 7. CHỈ SỐ (lưới 2 cột) ──────────────────────────────────────
-        mc = _card(panel, "CHỈ SỐ", pady=6)
-        metric_grid = [
-            ("Vel Y",  "_lbl_vy",    "Vel X",  "_lbl_vx"),
-            ("Góc",    "_lbl_ang",   "H/W",    "_lbl_ratio"),
-            ("Nguồn",  "_lbl_src",   "FPS",    "_lbl_fps"),
-        ]
-        for row_data in metric_grid:
-            r = tk.Frame(mc, bg=T["card"]); r.pack(fill="x", pady=2)
+        _sep()
+
+        # ── 6. CHỈ SỐ ────────────────────────────────────────────────────
+        mc = _section("CHỈ SỐ")
+        for row_data in [
+            ("Vel Y", "_lbl_vy",  "Vel X", "_lbl_vx"),
+            ("Góc",   "_lbl_ang", "H/W",   "_lbl_ratio"),
+            ("Src",   "_lbl_src", "FPS",   "_lbl_fps"),
+        ]:
+            r = tk.Frame(mc, bg=BG); r.pack(fill="x", pady=1)
             for i in [0, 2]:
-                tk.Label(r, text=row_data[i]+":", font=("Courier New", 8),
-                         fg=T["sub"], bg=T["card"], width=7, anchor="w").pack(side="left")
-                lbl = tk.Label(r, text="—", font=("Courier New", 9, "bold"),
-                               fg=T["text"], bg=T["card"], width=6, anchor="w")
+                tk.Label(r, text=row_data[i]+":", font=("Courier New", 7),
+                         fg=T["sub"], bg=BG, width=6, anchor="w").pack(side="left")
+                lbl = tk.Label(r, text="—", font=("Courier New", 8, "bold"),
+                               fg=T["text"], bg=BG, width=7, anchor="w")
                 lbl.pack(side="left")
                 setattr(self, row_data[i + 1], lbl)
                 if i == 0:
-                    tk.Label(r, text="│", font=("Courier New", 9),
-                             fg=T["border"], bg=T["card"]).pack(side="left", padx=4)
+                    tk.Label(r, text="│", font=("Courier New", 7),
+                             fg=T["border"], bg=BG).pack(side="left", padx=2)
 
-        # ── 8. NGƯỠNG PHÁT HIỆN ─────────────────────────────────────────
-        tc = _card(panel, "NGƯỠNG PHÁT HIỆN", pady=6)
-        for fname, label in [
-            ("fall_velocity_threshold", "Fall vel"),
-            ("body_angle_lying",        "Góc nằm"),
-            ("aspect_ratio_lying",      "H/W nằm"),
-            ("fall_confirm_frames",     "Confirm"),
-            ("walk_velocity_threshold", "Walk vel"),
-        ]:
-            r = tk.Frame(tc, bg=T["card"]); r.pack(fill="x", pady=2)
-            tk.Label(r, text=label + ":", font=("Courier New", 8), fg=T["sub"],
-                     bg=T["card"], width=11, anchor="w").pack(side="left")
-            var = tk.StringVar(value=str(getattr(self._config, fname)))
-            tk.Entry(r, textvariable=var, width=7,
-                     bg=T["panel"], fg=T["text"], insertbackground=T["text"],
-                     relief="flat", font=("Courier New", 9)).pack(side="left", padx=4)
-            self._thresh_vars[fname] = var
-        _btn(tc, "↑  APPLY", self._apply_thresh,
-             fg=T["text"], bg=T["border"]).pack(fill="x", pady=(6, 0))
+        _sep()
 
-        # ── 9. SỰ KIỆN ──────────────────────────────────────────────────
-        lc = _card(panel, "SỰ KIỆN", pady=0)
-        log_frame = tk.Frame(lc, bg=T["panel"])
-        log_frame.pack(fill="both", expand=True)
-        self._log = tk.Text(log_frame, height=8, bg=T["panel"], fg=T["text"],
-                             font=("Courier New", 7), relief="flat",
-                             state="disabled", wrap="word")
+        # ── 7. ÂM THANH (YAMNet) ────────────────────────────────────────
+        au = _section("ÂM THANH (YAMNet)")
+        au_hdr = tk.Frame(au, bg=BG); au_hdr.pack(fill="x")
+        self._audio_status_lbl = tk.Label(au_hdr, text="KHÔNG KHẢ DỤNG",
+            font=("Courier New", 10, "bold"), fg=T["sub"], bg=BG, anchor="w")
+        self._audio_status_lbl.pack(side="left")
+        self._audio_api_badge = tk.Label(au_hdr, text="[API: —]",
+            font=("Courier New", 7), fg=T["sub"], bg=BG)
+        self._audio_api_badge.pack(side="right")
+        self._audio_class_lbl = tk.Label(au, text="",
+            font=("Courier New", 7), fg=T["sub"], bg=BG, anchor="w")
+        self._audio_class_lbl.pack(fill="x")
+        self._audio_conf_lbl = tk.Label(au, text="",
+            font=("Courier New", 7), fg=T["sub"], bg=BG, anchor="w")
+        self._audio_conf_lbl.pack(fill="x")
+
+        _sep()
+
+        # ── 8. SỰ KIỆN (expand, chiếm phần còn lại) ─────────────────────
+        lc = tk.Frame(panel, bg=BG)
+        lc.pack(fill="both", expand=True, padx=14, pady=(10, 4))
+        tk.Label(lc, text="SỰ KIỆN", font=("Courier New", 7, "bold"),
+                 fg=T["sub"], bg=BG, anchor="w").pack(fill="x")
+        log_frame = tk.Frame(lc, bg=T["card"])
+        log_frame.pack(fill="both", expand=True, pady=(4, 0))
+        self._log = tk.Text(log_frame, bg=T["card"], fg=T["text"],
+                            font=("Courier New", 7), relief="flat",
+                            state="disabled", wrap="word")
         self._log.pack(side="left", fill="both", expand=True)
         sb = tk.Scrollbar(log_frame, command=self._log.yview)
         sb.pack(side="right", fill="y")
         self._log.configure(yscrollcommand=sb.set)
+
+        # Khởi tạo thresh_vars (dùng nội bộ, không hiển thị)
+        for fname in ["fall_velocity_threshold", "body_angle_lying",
+                      "aspect_ratio_lying", "fall_confirm_frames",
+                      "walk_velocity_threshold"]:
+            self._thresh_vars[fname] = tk.StringVar(
+                value=str(getattr(self._config, fname)))
 
     # ── Controls ───────────────────────────────────────────────────────────────
 
@@ -507,18 +323,23 @@ class FallDetectionApp:
         else:
             self._log_ev("⚠ Backend offline — dùng config mặc định")
 
-        cam_source = 0  # webcam laptop
+        # Fix 1: model_complexity=0 → MediaPipe nhanh nhất (~8ms vs ~25ms)
+        self._config.model_complexity = 0
 
-        # Tự động bật face recognition nếu backend có thành viên với ảnh
+        cam_source = self._video_source
+
+        # Bật face recognition tự động khi backend online (không cần thao tác desktop)
+        # Mobile đăng ký bệnh nhân → WS push → desktop tự nhận diện
         use_face, self._family_manager = self._init_face_recognition()
 
-        self._queue  = queue.Queue(maxsize=3)
+        # Fix 2: queue=1 → luôn hiển thị frame MỚI NHẤT, không bị tích lũy độ trễ
+        self._queue  = queue.Queue(maxsize=1)
         self._worker = CameraWorker(
             camera_source   = cam_source,
             result_queue    = self._queue,
-            use_yolo        = self._yolo_var.get(),
+            use_yolo        = True,    # luôn bật YOLO
             use_face        = use_face,
-            use_transformer = self._transformer_var.get(),
+            use_transformer = True,    # luôn bật AI Transformer
             config          = self._config,
             features        = self._features,
             camera_id       = "cam_0",
@@ -531,62 +352,59 @@ class FallDetectionApp:
 
         self._btn_start.config(state="disabled")
         self._btn_stop.config(state="normal")
-        face_txt  = " | Face ID" if use_face                      else ""
-        trans_txt = " | AI"      if self._transformer_var.get() else ""
-        yolo_txt  = " | YOLO"   if self._yolo_var.get()        else ""
-        audio_txt = " | Audio"  if self._features.enable_sound_detection else ""
-        self._log_ev(f"▶ Webcam{yolo_txt}{face_txt}{trans_txt}{audio_txt}")
+
+        # Cập nhật badges (YOLO · AI · Face)
+        self._badge_yolo.config(fg=T["ok"])
+        self._badge_ai.config(fg="#ff9f40")
+        self._badge_face.config(fg=T["face"] if use_face else T["sub"])
+
+        # Cập nhật face status label
+        if use_face:
+            self._face_status_lbl.config(
+                text="⚙ Tự động · đang tải thành viên...", fg=T["sub"])
+        else:
+            self._face_status_lbl.config(
+                text="○ Không có thành viên đăng ký ảnh", fg=T["sub"])
+
+        audio_txt = " | Audio" if self._features.enable_sound_detection else ""
+        face_txt  = " | Face ID ✓" if use_face else " | Face ID (chưa có thành viên)"
+        self._log_ev(f"▶ Camera — YOLO | AI{face_txt}{audio_txt}")
 
     def _init_face_recognition(self):
         """
-        Kiểm tra /family-members/all — nếu có ảnh thì bật face recognition,
-        không có thì bỏ qua (không load dlib, không tốn tài nguyên).
-        Trả về (use_face: bool, family_manager hoặc None).
+        Tự động kiểm tra backend:
+        - Có thành viên nào đã đăng ký ảnh khuôn mặt → bật Face ID
+        - Không có → tắt Face ID, tiết kiệm tài nguyên
+        Trả về (use_face: bool, FamilyManager | None).
         """
-        import httpx
-        from core.family_manager import FamilyManager
-        def _log(msg):
-            print(f"[Face] {msg}")
-            self._log_ev(f"[Face] {msg}")
-
-        url = f"{self._backend.base_url}/family-members/all"
-        _log(f"GET {url}")
+        import requests as _req
         try:
-            r = httpx.get(url, timeout=3.0)
-            _log(f"HTTP {r.status_code}")
-            if r.status_code != 200:
-                _log(f"✗ API lỗi HTTP {r.status_code} — tắt nhận diện")
+            r = _req.get(
+                f"{self._backend.base_url}/family-members/all", timeout=3)
+            if r.status_code == 200:
+                data    = r.json()
+                members = data if isinstance(data, list) else data.get("members", [])
+                has_faces = any(m.get("face_image_url") for m in members)
+                if not has_faces:
+                    self._log_ev(
+                        f"ℹ Face ID: {len(members)} thành viên nhưng chưa có ảnh — tắt")
+                    return False, None
+                self._log_ev(
+                    f"✓ Face ID: phát hiện {sum(1 for m in members if m.get('face_image_url'))}"
+                    f"/{len(members)} thành viên có ảnh — bật tự động")
+            else:
+                self._log_ev(f"⚠ Face ID: backend trả HTTP {r.status_code} — tắt")
                 return False, None
-
-            raw = r.json()
-            members = raw.get("members", [])
-            _log(f"Nhận {len(members)} thành viên từ API")
-            _log(f"Raw JSON keys: {list(raw.keys())}")
-
-            if not members:
-                _log("Không có thành viên — tắt nhận diện")
-                return False, None
-
-            for m in members:
-                has_img = bool(m.get("face_image_url"))
-                tag = "✓ có ảnh" if has_img else "✗ không có ảnh"
-                _log(f"  {m.get('name','?')} — {tag} | keys={list(m.keys())}")
-
-            has_images = any(m.get("face_image_url") for m in members)
-            if not has_images:
-                _log("Không có face_image_url nào — tắt nhận diện")
-                return False, None
-
-            _log("Bật nhận diện — sẽ trích xuất đặc trưng sau khi camera khởi động")
-            fm = FamilyManager(
-                base_url=self._backend.base_url,
-                on_log=lambda msg: self.root.after(0, lambda m=msg: self._log_ev(m)),
-            )
-            return True, fm
-
         except Exception as e:
-            _log(f"✗ Lỗi kết nối API: {e}")
+            self._log_ev(f"⚠ Face ID: không kết nối được backend ({e}) — tắt")
             return False, None
+
+        from core.family_manager import FamilyManager
+        fm = FamilyManager(
+            base_url=self._backend.base_url,
+            on_log=lambda msg: self.root.after(0, lambda m=msg: self._log_ev(m)),
+        )
+        return True, fm
 
     def _stop(self):
         if not self._running:
@@ -608,6 +426,7 @@ class FallDetectionApp:
     def _reset_falls(self):
         if self._worker:
             self._worker.reset_falls()
+        self._fall_engine.reset()
         self._fall_cnt.config(text="Số lần té: 0")
         self._alert_lbl.config(text="CHƯA PHÁT HIỆN", fg=T["ok"])
         self._log_ev("↺ Reset fall history")
@@ -667,9 +486,29 @@ class FallDetectionApp:
     def _open_family_mgmt(self):
         FamilyManagementWindow(self)
 
+    def _pick_video(self):
+        path = fd.askopenfilename(
+            title="Chọn video demo",
+            filetypes=[("Video", "*.mp4 *.avi *.mov *.mkv"), ("All", "*.*")],
+        )
+        if path:
+            self._video_source = path
+            self._log_ev(f"📹 Video: {Path(path).name}")
+        else:
+            self._video_source = 0
+            self._log_ev("📷 Nguồn: Webcam")
+
+    def _set_webcam(self):
+        self._video_source = 0
+        self._log_ev("📷 Nguồn: Webcam")
+
     # ── Poll queue ─────────────────────────────────────────────────────────────
 
     def _poll(self):
+        # Cập nhật đồng hồ
+        import datetime as _dt
+        self._time_lbl.config(text=_dt.datetime.now().strftime("%H:%M:%S"))
+
         try:
             while True:
                 item = self._queue.get_nowait()
@@ -685,37 +524,48 @@ class FallDetectionApp:
 
     def _update(self, wf: WorkerFrame):
         self._frame_id += 1
-        result = wf.result
         self._last_frame_bgr = wf.frame_bgr
 
-        h, w = wf.frame_bgr.shape[:2]
-        if self._renderer is None or self._renderer.w != w:
-            self._renderer = OverlayRenderer(w, h)
+        self._render_frame(wf)
+        self._update_state_panel(wf)
+        self._update_ai_panel(wf)
+        self._update_fall_panel(wf)
+        self._update_face_panel(wf)
+        self._update_audio_panel(wf)
+        self._update_patient_monitoring(wf)
+        self._maybe_send_pose_event(wf)
+        self._send_person_detected(wf)
 
+    def _render_frame(self, wf: WorkerFrame):
+        ih, iw = wf.frame_bgr.shape[:2]
+        cw = self._cam.winfo_width()  or 1200
+        ch = self._cam.winfo_height() or 800
+        scale = min(cw * 0.88 / iw, ch * 0.88 / ih)
+        new_w = max(1, int(iw * scale))
+        new_h = max(1, int(ih * scale))
+        base  = cv2.resize(wf.frame_bgr, (new_w, new_h),
+                           interpolation=cv2.INTER_LINEAR)
+        if self._renderer is None or self._renderer.w != new_w:
+            self._renderer = OverlayRenderer(new_w, new_h)
         rendered = self._renderer.render(
-            wf.frame_bgr.copy(), result, wf.fps,
-            backend_ok=self._backend.connected,
-            fall_vel_threshold=self._config.fall_velocity_threshold,
-            recognized_persons=wf.recognized_persons,
+            base, wf.result, wf.fps,
+            backend_ok          = self._backend.connected,
+            fall_vel_threshold  = self._config.fall_velocity_threshold,
+            recognized_persons  = wf.recognized_persons,
         )
-
         rgb   = cv2.cvtColor(rendered, cv2.COLOR_BGR2RGB)
-        img   = Image.fromarray(rgb)
-        cw    = self._cam.winfo_width()  or 960
-        ch    = self._cam.winfo_height() or 560
-        img.thumbnail((cw, ch), Image.LANCZOS)
-        photo = ImageTk.PhotoImage(img)
+        photo = ImageTk.PhotoImage(Image.fromarray(rgb))
         self._cam.config(image=photo, text="")
         self._cam.image = photo
 
-        # State label
+    def _update_state_panel(self, wf: WorkerFrame):
+        result = wf.result
         s  = str(result.state)
         sc = STATE_COLOR_TK.get(s, T["sub"])
         self._state_lbl.config(text=STATE_LABELS_VN.get(s, "?"), fg=sc)
         conf = result.metrics.confidence if result.metrics else 0.0
         self._conf_lbl.config(text=f"Confidence: {conf:.0%}")
 
-        # Metrics
         vy = result.velocity_y
         self._lbl_vy.config(
             text=f"{abs(vy):.0f}",
@@ -727,112 +577,54 @@ class FallDetectionApp:
             self._lbl_src.config(text=result.metrics.source)
         self._lbl_fps.config(text=f"{wf.fps:.0f}")
 
-        # Backend dot
         ok = self._backend.connected
         self._dot.config(
             text="● ONLINE" if ok else "● OFFLINE",
             fg=T["ok"] if ok else T["danger"])
 
-        # ── Transformer AI display ─────────────────────────────────────────
+    def _update_ai_panel(self, wf: WorkerFrame):
         tr = wf.transformer_result
-        trans_fall = False
         if tr is not None and tr.ready:
-            trans_fall = tr.is_fall
-            if trans_fall:
-                ai_color = T["danger"]
-                ai_text  = f"FALL  {tr.confidence:.0%}"
+            if tr.is_fall:
+                self._ai_lbl.config(text=f"FALL  {tr.confidence:.0%}", fg=T["danger"])
             else:
-                ai_color = T["ok"]
-                ai_text  = f"SAFE  {tr.confidence:.0%}"
-            self._ai_lbl.config(text=ai_text, fg=ai_color)
-            if hasattr(self, "_worker") and self._worker and self._worker._transformer:
-                buf  = self._worker._transformer.buffer_size
+                self._ai_lbl.config(text=f"SAFE  {tr.confidence:.0%}", fg=T["ok"])
+            if self._worker and self._worker._transformer:
+                buf   = self._worker._transformer.buffer_size
                 total = self._worker._transformer.num_frames
                 self._ai_buf.config(text=f"Buffer {buf}/{total}")
         elif tr is not None and not tr.ready:
-            if hasattr(self, "_worker") and self._worker and self._worker._transformer:
-                buf  = self._worker._transformer.buffer_size
+            if self._worker and self._worker._transformer:
+                buf   = self._worker._transformer.buffer_size
                 total = self._worker._transformer.num_frames
                 self._ai_lbl.config(text=f"Đang nạp ({buf}/{total})", fg=T["sub"])
-                self._ai_buf.config(text="")
+            self._ai_buf.config(text="")
         else:
             self._ai_lbl.config(text="Tắt", fg=T["sub"])
             self._ai_buf.config(text="")
 
-        # ── Fall alert (rule-based OR transformer AI) ──────────────────────
-        # ── Fall alert: Transformer xác nhận trước, rule-based xác nhận sau ──
-        rule_fall = result.is_falling
+    def _update_fall_panel(self, wf: WorkerFrame):
+        result    = wf.result
+        tr        = wf.transformer_result
         vel_y_abs = abs(result.velocity_y)
 
-        # Thêm biến theo dõi thời điểm bắt đầu nằm
-        current_lying = (str(result.state) == str(PoseState.LYING))
-        was_upright   = str(result.prev_state) in (
-            str(PoseState.STANDING),
-            str(PoseState.WALKING),
-            str(PoseState.SITTING),
-        )
+        decision = self._fall_engine.update(result, tr, vel_y_abs)
 
-
-        # Cập nhật thời điểm bắt đầu nằm — chống flicker:
-        # _lying_start_t chỉ reset sau >= 5 frame đứng liên tiếp (không phải 1 frame flicker)
-        if current_lying:
-            self._non_lying_streak = 0
-            if self._lying_start_t == 0.0:          # lần đầu vào LYING trong bout này
-                self._lying_start_t = time.time()
-            # else: giữ nguyên start time, không reset khi flicker quay lại LYING
-        else:
-            self._non_lying_streak += 1
-            if self._non_lying_streak >= 15:        # đứng dậy thật sự, không phải flicker
-                self._lying_start_t = 0.0
-        lying_duration = (
-            (time.time() - self._lying_start_t)
-            if (current_lying and self._lying_start_t > 0)
-            else float("inf")
-        )
-
-        #log
-        if current_lying and was_upright:
+        if decision.current_lying and decision.was_upright:
             self._log_ev(
-                f"[VEL] vel_y={abs(vy):.0f}  dur={lying_duration:.1f}s  rule={rule_fall}  ai={tr.is_fall if tr and tr.ready else '-'}")
+                f"[VEL] vel_y={vel_y_abs:.0f}  dur={decision.lying_duration:.1f}s  "
+                f"rule={decision.rule_fall}  ai={tr.is_fall if tr and tr.ready else '-'}"
+            )
 
-
-        # Bước 1: Transformer phát hiện FALL không?
-        ai_sees_fall = (
-            tr is not None and
-            tr.ready and
-            tr.is_fall and
-            vel_y_abs > 150.0 and        # velocity đủ lớn
-            current_lying and           # đang nằm
-            was_upright and             # trước đó đứng/đi/ngồi
-            lying_duration < 1.0       # trong 2s đầu nằm xuống
-        )
-
-        # Bước 2: Nếu AI thấy FALL → hỏi rule-based xác nhận
-        # Nếu AI không thấy → bỏ qua rule-based
-        trans_fall = ai_sees_fall and rule_fall
-
-        # Chỉ báo khi CẢ 2 đồng ý
-        any_fall = trans_fall
-        if current_lying and was_upright:
-            print(
-                f"[App] vel={vel_y_abs:.0f} ai={tr.is_fall if tr and tr.ready else '-'} rule={rule_fall} trans={trans_fall}")
-
-        if any_fall:
+        if decision.final_fall:
             self._alert_blink = not self._alert_blink
-            if rule_fall and trans_fall:
-                src = "Rules + AI"
-            elif trans_fall:
-                src = "AI Transformer"
-            else:
-                src = "Rule-based"
             self._alert_lbl.config(
                 text="⚠  TÉ NGÃ !",
                 fg=T["danger"] if self._alert_blink else T["warn"])
-            self._fall_src_lbl.config(text=f"Nguồn: {src}", fg=T["sub"])
+            self._fall_src_lbl.config(text=f"Nguồn: {decision.source}", fg=T["sub"])
 
-            # Log transformer-only fall once per trigger
-            if trans_fall and not rule_fall:
-                if not getattr(self, "_trans_fall_logged", False):
+            if decision.ai_sees_fall and not decision.rule_fall:
+                if not self._trans_fall_logged:
                     self._log_ev(
                         f"⚠ AI TÉ NGÃ [{time.strftime('%H:%M:%S')}]  "
                         f"conf={tr.confidence:.0%}"
@@ -851,13 +643,21 @@ class FallDetectionApp:
 
         self._fall_cnt.config(text=f"Số lần té: {result.fall_count}")
 
-        # ── Audio engine status + result ──────────────────────────────────
-        self._update_audio_panel(wf)
+        should_beep = result.fall_just_triggered or (
+            decision.final_fall and not decision.rule_fall and not self._trans_fall_logged
+        )
+        self._beep.trigger(should_beep)
 
-        # ── Face recognition UI update ─────────────────────────────────────
+        if result.fall_just_triggered:
+            self._log_ev(
+                f"⚠ TÉ NGÃ [{time.strftime('%H:%M:%S')}]  "
+                f"v={result.fall_max_velocity:.0f}px/s  "
+                f"from={result.prev_state}  📹 ghi clip…"
+            )
+
+    def _update_face_panel(self, wf: WorkerFrame):
         persons = wf.recognized_persons
         if persons:
-            # Hiển thị người có confidence cao nhất (hoặc người được nhận diện)
             known = [p for p in persons if p.is_known]
             best  = max(known, key=lambda p: p.confidence) if known else persons[0]
             if best.is_known:
@@ -872,50 +672,30 @@ class FallDetectionApp:
             self._face_name_lbl.config(text="Chưa phát hiện", fg=T["sub"])
             self._face_conf_lbl.config(text="", fg=T["sub"])
 
-        self._send_person_detected(wf)
-
-        # ── Beep cảnh báo khi phát hiện té ───────────────────────────────
-        should_beep = result.fall_just_triggered or (trans_fall and not rule_fall
-                      and not self._trans_fall_logged)
-        if should_beep:
-            now_t = time.time()
-            if now_t - self._last_beep_t >= 3.0:
-                _beep_fall()
-                self._last_beep_t = now_t
-
-        # ── Fall event (worker gửi kèm clip_url sau khi upload xong) ─────
-        if result.fall_just_triggered:
-            self._log_ev(
-                f"⚠ TÉ NGÃ [{time.strftime('%H:%M:%S')}]  "
-                f"v={result.fall_max_velocity:.0f}px/s  "
-                f"from={result.prev_state}  📹 ghi clip…"
-            )
-
-        # ── Theo dõi tư thế bệnh nhân ─────────────────────────────────────
-        self._update_patient_monitoring(wf)
-
-        # ── Periodic pose event (mỗi 30 frames) ───────────────────────────
-        if self._frame_id % 30 == 0 and result.metrics:
-            m = result.metrics
-            self._backend.send_pose(PoseEvent(
-                event_type        = EventType.POSE_CHANGE,
-                camera_id         = "cam_0",
-                timestamp         = wf.timestamp,
-                state             = result.state,
-                prev_state        = result.prev_state,
-                velocity_px_per_s = result.velocity_y,
-                metrics           = BodyMetricsPayload(
-                    body_angle   = m.body_angle,
-                    aspect_ratio = m.aspect_ratio,
-                    center_x     = m.center_x,
-                    center_y     = m.center_y,
-                    confidence   = m.confidence,
-                    hip_y        = m.hip_y,
-                    shoulder_y   = m.shoulder_y,
-                    ankle_y      = m.ankle_y,
-                ),
-                frame_id          = self._frame_id,
-            ))
+    def _maybe_send_pose_event(self, wf: WorkerFrame):
+        result = wf.result
+        if self._frame_id % 30 != 0 or not result.metrics:
+            return
+        m = result.metrics
+        self._backend.send_pose(PoseEvent(
+            event_type        = EventType.POSE_CHANGE,
+            camera_id         = "cam_0",
+            timestamp         = wf.timestamp,
+            state             = result.state,
+            prev_state        = result.prev_state,
+            velocity_px_per_s = result.velocity_y,
+            metrics           = BodyMetricsPayload(
+                body_angle   = m.body_angle,
+                aspect_ratio = m.aspect_ratio,
+                center_x     = m.center_x,
+                center_y     = m.center_y,
+                confidence   = m.confidence,
+                hip_y        = m.hip_y,
+                shoulder_y   = m.shoulder_y,
+                ankle_y      = m.ankle_y,
+            ),
+            frame_id          = self._frame_id,
+        ))
 
     def _update_audio_panel(self, wf: WorkerFrame):
         """Refresh the YAMNet audio panel on every frame."""
@@ -994,7 +774,7 @@ class FallDetectionApp:
         """Khớp khuôn mặt với kết quả pose gần nhất (ưu tiên YOLO multi-person)."""
         if wf.all_person_results:
             for pr in wf.all_person_results:
-                if _face_center_in_bbox(person.box, pr.bbox):
+                if face_center_in_bbox(person.box, pr.bbox):
                     return pr.result.state
             # Fallback: lấy người gần tâm khuôn mặt nhất
             fcx = (person.box.x1 + person.box.x2) // 2
@@ -1019,6 +799,10 @@ class FallDetectionApp:
         for person in wf.recognized_persons:
             if not person.is_known:
                 continue
+            # Bỏ qua nếu cả is_patient lẫn notify_on_fall đều False
+            if not person.is_patient and not person.notify_on_fall:
+                continue
+            # Chỉ gửi PatientPoseEvent nếu is_patient=True
             if not person.is_patient:
                 continue
 
@@ -1027,14 +811,17 @@ class FallDetectionApp:
             last_sent     = self._patient_last_sent.get(person.person_id, 0.0)
 
             state_changed = current_state != last_state
-            heartbeat_due = now - last_sent >= 10.0
+            heartbeat_due = now - last_sent >= 8.0
 
             if state_changed or heartbeat_due:
                 self._patient_last_state[person.person_id] = current_state
                 self._patient_last_sent[person.person_id]  = now
 
+                # Không gửi nếu feature tắt hoặc notify_on_fall=False
                 if not self._features.enable_patient_pose_notification:
-                    continue  # không gửi thông báo, chỉ cập nhật state local
+                    continue
+                if not person.notify_on_fall:
+                    continue  # nhận ra người nhưng không gửi thông báo
 
                 m = wf.result.metrics
                 event = PatientPoseEvent(

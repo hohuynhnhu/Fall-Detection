@@ -14,7 +14,11 @@
       "Bash(Select-Object -ExpandProperty Name)",
       "PowerShell(head *)",
       "PowerShell(Get-ChildItem -Path \"D:\\\\luan_van\\\\Fall-Detection\" -Force | Where-Object {$_.PSIsContainer} | Select-Object -ExpandProperty FullName)",
-      "Bash(Get-ChildItem -Path \"D:\\\\luan_van\\\\fall-detection-backend\" -Recurse -Depth 2)"
+      "Bash(Get-ChildItem -Path \"D:\\\\luan_van\\\\fall-detection-backend\" -Recurse -Depth 2)",
+      "Bash(venv\\\\Scripts\\\\python.exe -c \"import torch; print\\('CUDA:', torch.cuda.is_available\\(\\)\\); print\\('GPU:', torch.cuda.get_device_name\\(0\\) if torch.cuda.is_available\\(\\) else 'none'\\); import onnxruntime as ort; print\\('ORT providers:', ort.get_available_providers\\(\\)\\)\")",
+      "Bash(cd /mnt/d/luan_van/Fall-Detection && python -c \"import ast, sys; ast.parse\\(open\\('src/app.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\" 2>&1)",
+      "Bash(Get-ChildItem -Path \"D:\\\\luan_van\\\\Fall-Detection\" -Recurse -Force)",
+      "Bash(not exist *)"
     ]
   }
 }

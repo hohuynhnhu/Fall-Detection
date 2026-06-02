@@ -42,14 +42,14 @@ class EventType(str, Enum):
 class ThresholdConfig(BaseModel):
     """Ngưỡng phân loại tư thế và phát hiện té ngã — đồng bộ từ backend về."""
     # Pose classification
-    body_angle_lying:        float = Field(75.0,  description="Góc cột sống (°) để coi là nằm")
+    body_angle_lying:        float = Field(60.0,  description="Góc cột sống (°) để coi là nằm")
     body_angle_sitting:      float = Field(45.0,  description="Góc cột sống (°) để coi là ngồi")
-    aspect_ratio_lying:      float = Field(0.45,  description="H/W bbox < ngưỡng → nằm")
+    aspect_ratio_lying:      float = Field(0.35,  description="H/W bbox < ngưỡng → nằm")
     torso_ratio_sitting:     float = Field(0.42,  description="Tỉ lệ torso để phân biệt đứng/ngồi")
     bend_shoulder_drop_threshold: float = 40.0  # px shoulder xuống so với baseline
     bend_hip_max_drop: float = 25.0  # px hip tối đa xuống (nếu lớn hơn → fall)
     # Fall detection
-    fall_velocity_threshold: float = Field(150.0,  description="Vận tốc xuống (px/s) trigger fall")
+    fall_velocity_threshold: float = Field(40.0,  description="Vận tốc xuống (px/s) trigger fall")
     fall_confirm_frames:     int   = Field(10,     description="Số frame LYING liên tiếp để confirm")
     fall_history_window:     int   = Field(30,    description="Cửa sổ frame tính velocity")
     # Walking
@@ -57,7 +57,7 @@ class ThresholdConfig(BaseModel):
     walk_knee_lift_threshold: float = Field(0.08,  description="Ngưỡng nâng gối chuẩn hóa")
     walk_alternating_window:  int   = Field(15,    description="Số frame kiểm tra gối xen kẽ")
     # Fall transition time guard
-    fall_transition_max_s:   float = Field(2.0,   description="Nếu từ đứng → nằm mất hơn N giây → không phải té")
+    fall_transition_max_s:   float = Field(2.5,   description="Nếu từ đứng → nằm mất hơn N giây → không phải té")
     # Sleep-as-fall: treat prolonged lying as fall (feature-flag controlled)
     sleep_confirm_frames:    int   = Field(150, description="Số frame LYING để coi là ngủ/nằm = té (≈5s @ 30fps)")
     # Camera

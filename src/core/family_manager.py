@@ -50,6 +50,7 @@ class FamilyManager:
         self._threshold = threshold
         self._on_log    = on_log   # callback(msg: str) hiện log lên UI
         # {person_id: {name, is_patient, embeddings: [ndarray(512)]}}
+        # {person_id: {name, is_patient, notify_on_fall, embeddings: [ndarray(512)]}}
         self._members: Dict[str, dict] = {}
         self._lock     = threading.Lock()
         self._running  = False
@@ -59,19 +60,25 @@ class FamilyManager:
 
     # ── Public ──────────────────────────────────────────────────────────────────
 
-    def start(self):
+    def start(self, shared_recognizer=None):
         """
         Khởi tạo InsightFace, load gallery từ API, bắt đầu WS listener thread.
         Gọi từ CameraWorker.run() sau khi FaceEngine đã sẵn sàng.
+        shared_recognizer: dùng chung FaceRecognizer từ FaceEngine để tránh load buffalo_l 2 lần.
         """
         if not _FACE_OK:
             self._log("⚠ FamilyManager: insightface chưa cài — tắt nhận diện")
             return
-        try:
-            self._face = FaceRecognizer()
-        except Exception as e:
-            self._log(f"✗ FamilyManager: FaceRecognizer init lỗi: {e}")
-            return
+        if shared_recognizer is not None:
+            # Dùng instance đã load sẵn — không tốn thêm thời gian khởi động
+            self._face = shared_recognizer
+            self._log("✓ FamilyManager: dùng chung FaceRecognizer (bỏ qua load lần 2)")
+        else:
+            try:
+                self._face = FaceRecognizer()
+            except Exception as e:
+                self._log(f"✗ FamilyManager: FaceRecognizer init lỗi: {e}")
+                return
         self._running = True
         self._thread  = threading.Thread(
             target=self._run, daemon=True, name="FamilyManager"
@@ -109,28 +116,46 @@ class FamilyManager:
         with self._lock:
             d = self._members[best_id]
             return {
-                "person_id":  best_id,
-                "name":       d["name"],
-                "is_patient": d["is_patient"],
-                "confidence": float(best_score),
+                "person_id":      best_id,
+                "name":           d["name"],
+                "is_patient":     d["is_patient"],
+                "notify_on_fall": d.get("notify_on_fall", True),
+                "confidence":     float(best_score),
             }
 
     def add_encoding(
         self,
-        person_id:  str,
-        name:       str,
-        is_patient: bool,
-        embedding:  np.ndarray,
+        person_id:      str,
+        name:           str,
+        is_patient:     bool,
+        embedding:      np.ndarray,
+        notify_on_fall: bool = True,
     ):
         """Thêm embedding 512-d trực tiếp — dùng khi đăng ký khuôn mặt qua UI desktop."""
         with self._lock:
             if person_id not in self._members:
                 self._members[person_id] = {
-                    "name":       name,
-                    "is_patient": is_patient,
-                    "embeddings": [],
+                    "name":           name,
+                    "is_patient":     is_patient,
+                    "notify_on_fall": notify_on_fall,
+                    "embeddings":     [],
                 }
+            else:
+                self._members[person_id]["is_patient"]     = is_patient
+                self._members[person_id]["notify_on_fall"] = notify_on_fall
             self._members[person_id]["embeddings"].append(embedding)
+
+    def get_member_info(self, person_id: str) -> Optional[dict]:
+        """Trả về thông tin mới nhất của thành viên (tên, is_patient, notify_on_fall)."""
+        with self._lock:
+            d = self._members.get(person_id)
+            if d is None:
+                return None
+            return {
+                "name":           d["name"],
+                "is_patient":     d["is_patient"],
+                "notify_on_fall": d.get("notify_on_fall", True),
+            }
 
     def remove(self, person_id: str):
         with self._lock:
@@ -178,17 +203,19 @@ class FamilyManager:
             self._log(f"Face: tải {len(members)} thành viên, đang trích xuất đặc trưng...")
             for m in members:
                 self._download_and_encode(
-                    url        = m["face_image_url"],
-                    person_id  = m["person_id"],
-                    name       = m["name"],
-                    is_patient = m.get("is_patient", False),
+                    url            = m["face_image_url"],
+                    person_id      = m["person_id"],
+                    name           = m["name"],
+                    is_patient     = m.get("is_patient", False),
+                    notify_on_fall = m.get("notify_on_fall", True),
                 )
             self._log(f"✓ Face: sẵn sàng nhận diện {self.member_count()} thành viên")
         except Exception as e:
             self._log(f"✗ Face: load API thất bại: {e}")
 
     def _download_and_encode(
-        self, url: str, person_id: str, name: str, is_patient: bool
+        self, url: str, person_id: str, name: str,
+        is_patient: bool, notify_on_fall: bool = True,
     ):
         """Download ảnh từ URL, InsightFace extract 512-d embedding, lưu vào gallery."""
         try:
@@ -206,10 +233,15 @@ class FamilyManager:
             with self._lock:
                 if person_id not in self._members:
                     self._members[person_id] = {
-                        "name":       name,
-                        "is_patient": is_patient,
-                        "embeddings": [],
+                        "name":           name,
+                        "is_patient":     is_patient,
+                        "notify_on_fall": notify_on_fall,
+                        "embeddings":     [],
                     }
+                else:
+                    # Cập nhật metadata mới nhất (có thể thay đổi qua WS)
+                    self._members[person_id]["is_patient"]     = is_patient
+                    self._members[person_id]["notify_on_fall"] = notify_on_fall
                 self._members[person_id]["embeddings"].append(emb)
             tag = " [BN]" if is_patient else ""
             self._log(f"  ✓ {name}{tag} (id={person_id})")
@@ -241,14 +273,37 @@ class FamilyManager:
 
     def _handle_ws_message(self, msg: dict):
         msg_type = msg.get("type")
+
         if msg_type == "new_member":
             self._log(f"Face WS: thành viên mới '{msg.get('name', '')}'")
             self._download_and_encode(
-                url        = msg["face_image_url"],
-                person_id  = msg["person_id"],
-                name       = msg.get("name", ""),
-                is_patient = msg.get("is_patient", False),
+                url            = msg["face_image_url"],
+                person_id      = msg["person_id"],
+                name           = msg.get("name", ""),
+                is_patient     = msg.get("is_patient", False),
+                notify_on_fall = msg.get("notify_on_fall", True),
             )
+
+        elif msg_type == "update_member":
+            pid = msg.get("person_id", "")
+            if not pid:
+                return
+            with self._lock:
+                if pid not in self._members:
+                    self._log(f"Face WS: update_member {pid} chưa có trong gallery — bỏ qua")
+                    return
+                if "name" in msg:
+                    self._members[pid]["name"]           = msg["name"]
+                if "is_patient" in msg:
+                    self._members[pid]["is_patient"]     = bool(msg["is_patient"])
+                if "notify_on_fall" in msg:
+                    self._members[pid]["notify_on_fall"] = bool(msg["notify_on_fall"])
+                m = self._members[pid]
+            self._log(
+                f"Face WS: cập nhật '{m['name']}' (id={pid}) "
+                f"is_patient={m['is_patient']} notify_on_fall={m['notify_on_fall']}"
+            )
+
         elif msg_type == "remove_member":
             pid = msg.get("person_id", "")
             if pid:
