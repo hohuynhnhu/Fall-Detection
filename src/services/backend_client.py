@@ -1,32 +1,5 @@
 """
 src/services/backend_client.py — HTTP client gửi events lên backend
-
-── Desktop app GỌI (client → backend) ────────────────────────────────────────
-  GET    /health                    — kiểm tra kết nối lúc khởi động
-  GET    /config?device_id=cam_0    — lấy ThresholdConfig + FeatureConfig (mỗi 30s)
-  POST   /events/fall               — báo cáo sự kiện té ngã
-  POST   /events/pose               — báo cáo thay đổi tư thế (mỗi 30 frames)
-  POST   /events/person-detected    — báo cáo nhận diện khuôn mặt (debounce 5s)
-  POST   /device/status             — heartbeat trạng thái thiết bị (mỗi 5s)
-  GET    /family-members            — lấy danh sách thành viên
-  POST   /family-members            — thêm thành viên mới
-  DELETE /family-members/{id}       — xóa thành viên
-
-── Mobile app GỌI (mobile → backend) — backend cần implement ─────────────────
-  PATCH  /config/features           — bật/tắt tính năng từ mobile app
-    Request body:
-      { "enable_face_recognition":         bool,   ← nhận diện + đăng ký khuôn mặt
-        "enable_patient_pose_notification": bool,   ← thông báo tư thế bệnh nhân
-        "enable_sound_detection":          bool,
-        "sleep_as_fall":                   bool,
-        "sound_listen_seconds":            float }   ← tất cả đều optional (partial update)
-    Response: { "ok": true, "features": { ...updated FeatureConfig... } }
-
-  PATCH  /config/thresholds         — chỉnh ngưỡng phát hiện từ mobile app
-    Request body: bất kỳ field nào của ThresholdConfig (partial update)
-    Response: { "ok": true, "thresholds": { ...updated ThresholdConfig... } }
-
-  Desktop tự đọc lại qua GET /config mỗi 30s và áp dụng ngay khi có thay đổi.
 """
 from __future__ import annotations
 import asyncio
@@ -45,6 +18,31 @@ from schemas import (
 
 _AnyEvent = Union[FallEvent, PoseEvent, PersonDetectedPayload, PatientPoseEvent, FaceLogPayload]
 
+_JSON_HEADERS = {"Content-Type": "application/json"}
+
+# Timeout (giây) theo loại event — quan trọng thì dài hơn
+_TIMEOUT: dict = {
+    FallEvent:             10.0,
+    PatientPoseEvent:      10.0,
+    PoseEvent:              3.0,
+    PersonDetectedPayload:  2.0,
+    FaceLogPayload:         2.0,
+}
+
+# Số lần retry theo loại event — không quan trọng thì không retry
+_MAX_ATTEMPTS: dict = {
+    FallEvent:             3,
+    PatientPoseEvent:      3,
+    PoseEvent:             1,
+    PersonDetectedPayload: 1,  # drop ngay nếu fail, không block queue
+    FaceLogPayload:        1,
+}
+
+
+def _serialize(event: _AnyEvent) -> bytes:
+    """Serialize Pydantic model → JSON bytes, handle enum values correctly."""
+    return event.json().encode("utf-8")
+
 
 class BackendClient:
     def __init__(
@@ -61,7 +59,7 @@ class BackendClient:
         self.on_config_update  = on_config_update
         self.on_feature_update = on_feature_update
         self.status_interval   = status_interval
-        self.config_interval   = 5.0  # spec: poll mỗi 5s
+        self.config_interval   = 5.0
 
         self._loop:   Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread]          = None
@@ -86,7 +84,6 @@ class BackendClient:
 
     def stop(self):
         self._running = False
-        # Enqueue sentinel để unblock _event_send_loop đang chờ queue.get()
         if self._loop and self._queue:
             try:
                 self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
@@ -105,7 +102,7 @@ class BackendClient:
 
     async def _main(self):
         self._queue = asyncio.Queue(maxsize=200)
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=3.0) as client:
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=10.0) as client:
             await self._check_health(client)
             await asyncio.gather(
                 self._event_send_loop(client),
@@ -136,7 +133,6 @@ class BackendClient:
         camera_id:     str  = "cam_0",
         recognized_at: float = 0.0,
     ) -> None:
-        """Gửi log nhận diện khuôn mặt sau mỗi lần identify thành công. Non-blocking."""
         import time as _time
         self._enqueue(FaceLogPayload(
             person_id     = person_id,
@@ -151,10 +147,9 @@ class BackendClient:
         self.current_fps  = fps
         self.current_pose = pose
 
-    # ── Blocking helpers (UI startup / management dialogs) ────────────────────
+    # ── Blocking helpers ───────────────────────────────────────────────────────
 
     def fetch_config_sync(self) -> Optional[ThresholdConfig]:
-        """Lấy thresholds + features từ 2 endpoint riêng theo spec."""
         params = {"camera_id": self.camera_id}
         cfg = None
         try:
@@ -226,7 +221,7 @@ class BackendClient:
             try:
                 self._loop.call_soon_threadsafe(self._queue.put_nowait, item)
             except asyncio.QueueFull:
-                pass  # drop nếu queue tràn
+                pass
 
     async def _check_health(self, client: httpx.AsyncClient):
         try:
@@ -237,7 +232,6 @@ class BackendClient:
             self.last_error = str(e)
 
     async def _event_send_loop(self, client: httpx.AsyncClient):
-        """Xử lý mọi loại event trong queue (fall, pose, person-detected)."""
         _ROUTES = {
             FallEvent:             "/events/fall",
             PoseEvent:             "/events/pose",
@@ -250,17 +244,45 @@ class BackendClient:
                 event: _AnyEvent = await asyncio.wait_for(
                     self._queue.get(), timeout=1.0
                 )
-                if event is None:   # sentinel từ stop()
+                if event is None:
                     break
+
                 route = _ROUTES.get(type(event))
-                if route:
-                    r = await client.post(route, json=event.dict())
-                    self.connected = r.status_code < 500
+                if not route:
+                    continue
+
+                try:
+                    body = _serialize(event)
+                except Exception as e:
+                    print(f"[BackendClient] serialize FAIL type={type(event).__name__} err={e!r}")
+                    continue
+
+                max_attempts = _MAX_ATTEMPTS.get(type(event), 1)
+                timeout      = _TIMEOUT.get(type(event), 3.0)
+
+                for attempt in range(max_attempts):
+                    try:
+                        r = await asyncio.wait_for(
+                            client.post(route, content=body, headers=_JSON_HEADERS),
+                            timeout=timeout,
+                        )
+                        self.connected = r.status_code < 500
+                        if isinstance(event, PatientPoseEvent):
+                            print(f"[BackendClient] patient-pose OK attempt={attempt} status={r.status_code}")
+                        break
+                    except Exception as e:
+                        self.connected  = False
+                        self.last_error = repr(e)
+                        if isinstance(event, PatientPoseEvent):
+                            print(f"[BackendClient] patient-pose FAIL attempt={attempt} type={type(e).__name__} err={e!r}")
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep(1.0 * (attempt + 1))
+
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
                 self.connected  = False
-                self.last_error = str(e)
+                self.last_error = repr(e)
                 await asyncio.sleep(0.5)
 
     async def _config_poll_loop(self, client: httpx.AsyncClient):
@@ -297,6 +319,10 @@ class BackendClient:
                 state     = self.current_pose,
             )
             try:
-                await client.post("/events/heartbeat", json=payload.dict())
+                await client.post(
+                    "/events/heartbeat",
+                    content=payload.json().encode("utf-8"),
+                    headers=_JSON_HEADERS,
+                )
             except Exception:
                 pass

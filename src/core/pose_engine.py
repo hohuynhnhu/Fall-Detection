@@ -1,10 +1,9 @@
 """
 src/core/pose_engine.py
 
-MediaPipe Pose + YOLOv8 Pose fusion
-- MediaPipe: 33 keypoints, primary model
-- YOLO Pose: 17 keypoints, optional
-- Fusion: confidence-weighted average khi cả 2 detect được
+YOLOv8 Pose primary — MediaPipe chỉ dùng để vẽ skeleton (optional)
+- YOLO ByteTrack: tracking ID ổn định, không hallucinate đồ vật
+- MediaPipe: KHÔNG dùng để detect/classify nữa, chỉ vẽ keypoints nếu cần
 """
 from __future__ import annotations
 import cv2
@@ -12,47 +11,166 @@ import numpy as np
 import mediapipe as mp
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
-from collections import defaultdict
+from typing import Optional, Tuple, List
+from pathlib import Path
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
 except ImportError:
     YOLO_AVAILABLE = False
-
+# Đường dẫn tuyệt đối đến bytetrack_custom.yaml
+_TRACKER_CFG = str(Path(__file__).resolve().parent.parent / "bytetrack_custom.yaml")
+#                                          ↑ chỉ 2 parent: core → src
 
 @dataclass
 class PersonData:
-    person_id:   int           # ID tracking từ YOLO ByteTrack
-    metrics:     BodyMetrics
-    raw_kp:      np.ndarray    # (200,)
-    bbox:        tuple         # (x1, y1, x2, y2)
+    person_id: int
+    metrics:   "BodyMetrics"
+    raw_kp:    np.ndarray   # (200,) — [mp_zeros(33×4) + yolo(17×4)]
+    bbox:      tuple        # (x1, y1, x2, y2)
+
 
 @dataclass
 class BodyMetrics:
-    shoulder_y: float   = 0.0
-    hip_y: float        = 0.0
-    ankle_y: float      = 0.0
-    knee_l_y: float     = 0.0
-    knee_r_y: float     = 0.0
-    nose_y: float       = 0.0
-    wrist_l_y: float    = 0.0
-    wrist_r_y: float    = 0.0
-    body_angle: float   = 0.0    # 0° = đứng thẳng, 90° = nằm ngang
-    aspect_ratio: float = 1.5    # H/W bbox. < 0.6 → nằm
-    center_x: float     = 0.0
-    center_y: float     = 0.0
-    bbox_w: float       = 0.0
-    bbox_h: float       = 0.0
-    confidence: float   = 0.0
-    source: str         = "none" # "mediapipe" | "yolo" | "fused"
-    knee_lift_l: float  = 0.0   # normalized [0,1] cho walking detect
-    knee_lift_r: float  = 0.0
+    shoulder_y:  float = 0.0
+    hip_y:       float = 0.0
+    ankle_y:     float = 0.0
+    knee_l_y:    float = 0.0
+    knee_r_y:    float = 0.0
+    nose_y:      float = 0.0
+    wrist_l_y:   float = 0.0
+    wrist_r_y:   float = 0.0
+    body_angle:  float = 0.0   # 0°=đứng, 90°=nằm
+    aspect_ratio: float = 1.5  # H/W bbox keypoints
+    center_x:    float = 0.0
+    center_y:    float = 0.0
+    bbox_w:      float = 0.0
+    bbox_h:      float = 0.0
+    confidence:  float = 0.0
+    source:      str   = "yolo"
+    knee_lift_l: float = 0.0
+    knee_lift_r: float = 0.0
+    hip_z:       float = 0.0
+    ankle_z:     float = 0.0
+    ankle_reliable: bool = True
 
 
-# ── MediaPipe Extractor ────────────────────────────────────────────────────────
+# ── YOLO Pose Extractor ────────────────────────────────────────────────────────
 
-class MediaPipeExtractor:
+class YOLOPoseExtractor:
+    """YOLOv8 Pose — 17 COCO keypoints + ByteTrack tracking"""
+
+    # COCO keypoint indices
+    _NOSE        = 0
+    _L_SHOULDER  = 5;  _R_SHOULDER = 6
+    _L_HIP       = 11; _R_HIP      = 12
+    _L_KNEE      = 13; _R_KNEE     = 14
+    _L_ANKLE     = 15; _R_ANKLE    = 16
+    _L_WRIST     = 9;  _R_WRIST    = 10
+
+    # Confidence tối thiểu của keypoint để dùng
+    _MIN_KP_CONF = 0.50
+
+    def __init__(self, model_path: str = "yolov8n-pose.pt"):
+        if not YOLO_AVAILABLE:
+            raise ImportError("pip install ultralytics")
+        self.model = YOLO(model_path)
+
+    def _kp(self, kp_data: np.ndarray, idx: int) -> np.ndarray:
+        """Trả [x, y, conf]. Nếu conf thấp → trả zeros."""
+        if idx >= len(kp_data):
+            return np.zeros(3)
+        row = kp_data[idx]
+        x, y = float(row[0]), float(row[1])
+        c    = float(row[2]) if len(row) > 2 else 1.0
+        return np.array([x, y, c])
+
+    def _safe_mid(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Trung điểm 2 keypoint, ưu tiên bên nào có conf cao hơn."""
+        if a[2] >= self._MIN_KP_CONF and b[2] >= self._MIN_KP_CONF:
+            return (a[:2] + b[:2]) / 2
+        elif a[2] >= self._MIN_KP_CONF:
+            return a[:2]
+        elif b[2] >= self._MIN_KP_CONF:
+            return b[:2]
+        return (a[:2] + b[:2]) / 2  # cả 2 đều thấp → dùng trung bình
+
+    def kp_to_metrics(self, kp_data: np.ndarray, bbox_conf: float,
+                      frame_h: int, frame_w: int) -> BodyMetrics:
+        """Convert 17 YOLO keypoints → BodyMetrics."""
+        kp = self._kp
+
+        l_sh = kp(kp_data, self._L_SHOULDER)
+        r_sh = kp(kp_data, self._R_SHOULDER)
+        l_hp = kp(kp_data, self._L_HIP)
+        r_hp = kp(kp_data, self._R_HIP)
+        l_kn = kp(kp_data, self._L_KNEE)
+        r_kn = kp(kp_data, self._R_KNEE)
+        l_an = kp(kp_data, self._L_ANKLE)
+        r_an = kp(kp_data, self._R_ANKLE)
+        l_wr = kp(kp_data, self._L_WRIST)
+        r_wr = kp(kp_data, self._R_WRIST)
+        nose = kp(kp_data, self._NOSE)
+
+        shoulder = self._safe_mid(l_sh, r_sh)
+        hip      = self._safe_mid(l_hp, r_hp)
+        ankle    = self._safe_mid(l_an, r_an)
+
+        # body_angl e: góc vector shoulder→hip so với trục dọc
+        spine      = hip - shoulder
+        body_angle = math.degrees(
+            math.atan2(abs(spine[0]), abs(spine[1]) + 1e-6)
+        )
+        ankle_reliable = (l_an[2] >= self._MIN_KP_CONF or r_an[2] >= self._MIN_KP_CONF)
+
+
+        # Bounding box từ 8 keypoints chính
+        pts = np.array([
+            l_sh[:2], r_sh[:2],
+            l_hp[:2], r_hp[:2],
+            l_kn[:2], r_kn[:2],
+            l_an[:2], r_an[:2],
+        ])
+        xmin, ymin = pts.min(0)
+        xmax, ymax = pts.max(0)
+        bw = max(xmax - xmin, 1.0)
+        bh = max(ymax - ymin, 1.0)
+
+        ankle_hip = abs(float(ankle[1]) - float(hip[1])) + 1e-6
+
+        # Confidence = trung bình conf của 6 keypoint cốt lõi
+        core_confs = [l_sh[2], r_sh[2], l_hp[2], r_hp[2], l_an[2], r_an[2]]
+        confidence = float(np.mean(core_confs))
+
+        return BodyMetrics(
+            shoulder_y   = float(shoulder[1]),
+            hip_y        = float(hip[1]),
+            ankle_y      = float(ankle[1]),
+            knee_l_y     = float(l_kn[1]),
+            knee_r_y     = float(r_kn[1]),
+            nose_y       = float(nose[1]),
+            wrist_l_y    = float(l_wr[1]),
+            wrist_r_y    = float(r_wr[1]),
+            body_angle   = body_angle,
+            aspect_ratio = bh / bw,
+            center_x     = float((xmin + xmax) / 2),
+            center_y     = float((ymin + ymax) / 2),
+            bbox_w       = float(bw),
+            bbox_h       = float(bh),
+            confidence   = confidence,
+            source       = "yolo",
+            knee_lift_l  = max(0.0, float(hip[1] - l_kn[1])) / ankle_hip,
+            knee_lift_r  = max(0.0, float(hip[1] - r_kn[1])) / ankle_hip,
+            hip_z        = 0.0,
+            ankle_z      = 0.0,
+            ankle_reliable=ankle_reliable,
+        )
+
+
+# ── MediaPipe (chỉ dùng để vẽ skeleton) ───────────────────────────────────────
+
+class MediaPipeDrawer:
+    """Chỉ dùng để vẽ skeleton lên frame — KHÔNG dùng để detect/classify."""
     def __init__(self, model_complexity: int = 1):
         self._mp   = mp.solutions.pose
         self._draw = mp.solutions.drawing_utils
@@ -61,235 +179,107 @@ class MediaPipeExtractor:
             model_complexity=model_complexity,
             smooth_landmarks=True,
             enable_segmentation=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.6,
         )
 
-    def extract(self, frame_bgr: np.ndarray) -> Tuple[Optional[BodyMetrics], Optional[object], Optional[np.ndarray]]:
-        h, w = frame_bgr.shape[:2]
-        res  = self.pose.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-        if not res.pose_landmarks:
-            return None, None, None
+    def extract_landmarks(self, frame_bgr: np.ndarray):
+        """Trả landmarks để vẽ, hoặc None nếu không detect được."""
+        res = self.pose.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        return res.pose_landmarks if res.pose_landmarks else None
 
-        lm = res.pose_landmarks.landmark
-        L  = self._mp.PoseLandmark
-
-        def p(idx):
-            pt = lm[idx]
-            return np.array([pt.x * w, pt.y * h, pt.visibility])
-
-        l_sh = p(L.LEFT_SHOULDER);  r_sh = p(L.RIGHT_SHOULDER)
-        l_hp = p(L.LEFT_HIP);       r_hp = p(L.RIGHT_HIP)
-        l_kn = p(L.LEFT_KNEE);      r_kn = p(L.RIGHT_KNEE)
-        l_an = p(L.LEFT_ANKLE);     r_an = p(L.RIGHT_ANKLE)
-        l_wr = p(L.LEFT_WRIST);     r_wr = p(L.RIGHT_WRIST)
-        nose = p(L.NOSE)
-
-        shoulder = (l_sh[:2] + r_sh[:2]) / 2
-        hip      = (l_hp[:2] + r_hp[:2]) / 2
-        ankle    = (l_an[:2] + r_an[:2]) / 2
-
-        spine      = hip - shoulder
-        body_angle = math.degrees(math.atan2(abs(spine[0]), abs(spine[1]) + 1e-6))
-
-        pts  = np.array([l_sh[:2], r_sh[:2], l_hp[:2], r_hp[:2],
-                         l_kn[:2], r_kn[:2], l_an[:2], r_an[:2]])
-        xmin, ymin = pts.min(0);  xmax, ymax = pts.max(0)
-        bw = max(xmax - xmin, 1); bh = max(ymax - ymin, 1)
-
-        ankle_hip  = abs(ankle[1] - hip[1]) + 1e-6
-        vis        = [l_sh[2], r_sh[2], l_hp[2], r_hp[2], l_an[2], r_an[2]]
-        confidence = float(np.mean([v for v in vis if v > 0]) if any(v > 0 for v in vis) else 0.0)
-
-        # Raw normalized keypoints for transformer (33 × 4)
-        mp_raw = np.array(
-            [[l.x, l.y, l.z, l.visibility] for l in lm],
-            dtype=np.float32,
-        )
-
-        return BodyMetrics(
-            shoulder_y   = shoulder[1],
-            hip_y        = hip[1],
-            ankle_y      = ankle[1],
-            knee_l_y     = l_kn[1],
-            knee_r_y     = r_kn[1],
-            nose_y       = nose[1],
-            wrist_l_y    = l_wr[1],
-            wrist_r_y    = r_wr[1],
-            body_angle   = body_angle,
-            aspect_ratio = bh / bw,
-            center_x     = (xmin + xmax) / 2,
-            center_y     = (ymin + ymax) / 2,
-            bbox_w       = bw,
-            bbox_h       = bh,
-            confidence   = confidence,
-            source       = "mediapipe",
-            knee_lift_l  = max(0.0, (hip[1] - l_kn[1])) / ankle_hip,
-            knee_lift_r  = max(0.0, (hip[1] - r_kn[1])) / ankle_hip,
-        ), res.pose_landmarks, mp_raw
-
-    def draw(self, frame, landmarks, color=(80, 220, 80)):
-        # Chỉ vẽ keypoint dots, không vẽ đường kết nối
+    def draw(self, frame: np.ndarray, landmarks, color=(80, 220, 80)):
         lm_spec = self._draw.DrawingSpec(color=color, thickness=-1, circle_radius=4)
-        self._draw.draw_landmarks(
-            frame, landmarks, None, lm_spec, lm_spec)
+        self._draw.draw_landmarks(frame, landmarks, None, lm_spec, lm_spec)
 
     def close(self):
         self.pose.close()
 
 
-# ── YOLO Pose Extractor ────────────────────────────────────────────────────────
-
-class YOLOPoseExtractor:
-    """YOLOv8 Pose — 17 COCO keypoints"""
-    def __init__(self, model_path: str = "yolov8n-pose.pt"):
-        if not YOLO_AVAILABLE:
-            raise ImportError("Chạy: pip install ultralytics")
-        self.model = YOLO(model_path)
-
-    def extract(self, frame_bgr: np.ndarray) -> Tuple[Optional[BodyMetrics], Optional[np.ndarray]]:
-        results = self.model(frame_bgr, verbose=False)
-        if not results or len(results[0].keypoints.xy) == 0:
-            return None, None
-        boxes = results[0].boxes
-        if boxes is None or len(boxes) == 0:
-            return None, None
-
-        idx  = int(boxes.conf.argmax())
-        kps  = results[0].keypoints.xy[idx].cpu().numpy()
-        conf = (results[0].keypoints.conf[idx].cpu().numpy()
-                if results[0].keypoints.conf is not None else np.ones(17))
-
-        def kp(i):
-            return np.array([kps[i][0], kps[i][1], float(conf[i])])
-
-        l_sh = kp(5);  r_sh = kp(6)
-        l_hp = kp(11); r_hp = kp(12)
-        l_kn = kp(13); r_kn = kp(14)
-        l_an = kp(15); r_an = kp(16)
-
-        shoulder   = (l_sh[:2] + r_sh[:2]) / 2
-        hip        = (l_hp[:2] + r_hp[:2]) / 2
-        ankle      = (l_an[:2] + r_an[:2]) / 2
-        spine      = hip - shoulder
-        body_angle = math.degrees(math.atan2(abs(spine[0]), abs(spine[1]) + 1e-6))
-
-        pts  = np.array([l_sh[:2], r_sh[:2], l_hp[:2], r_hp[:2],
-                         l_kn[:2], r_kn[:2], l_an[:2], r_an[:2]])
-        xmin, ymin = pts.min(0); xmax, ymax = pts.max(0)
-        bw = max(xmax - xmin, 1); bh = max(ymax - ymin, 1)
-        ankle_hip  = abs(ankle[1] - hip[1]) + 1e-6
-
-        # Raw normalized keypoints for transformer (17 × 4): [x/w, y/h, 0, conf]
-        h, w = frame_bgr.shape[:2]
-        yolo_raw = np.zeros((17, 4), dtype=np.float32)
-        for i in range(min(17, len(kps))):
-            yolo_raw[i] = [kps[i][0] / w, kps[i][1] / h, 0.0, float(conf[i])]
-
-        return BodyMetrics(
-            shoulder_y   = shoulder[1],
-            hip_y        = hip[1],
-            ankle_y      = ankle[1],
-            knee_l_y     = l_kn[1],
-            knee_r_y     = r_kn[1],
-            body_angle   = body_angle,
-            aspect_ratio = bh / bw,
-            center_x     = (xmin + xmax) / 2,
-            center_y     = (ymin + ymax) / 2,
-            bbox_w       = bw,
-            bbox_h       = bh,
-            confidence   = float(boxes.conf[idx]),
-            source       = "yolo",
-            knee_lift_l  = max(0.0, (hip[1] - l_kn[1])) / ankle_hip,
-            knee_lift_r  = max(0.0, (hip[1] - r_kn[1])) / ankle_hip,
-        ), yolo_raw
-
-
-# ── Fusion Engine ──────────────────────────────────────────────────────────────
+# ── PoseEngine ─────────────────────────────────────────────────────────────────
 
 class PoseEngine:
-    def __init__(self, use_yolo: bool = False,
+    """
+    YOLO làm primary detector + tracker.
+    MediaPipe chỉ dùng để vẽ skeleton (tuỳ chọn, không ảnh hưởng logic).
+    """
+
+    def __init__(self, use_yolo: bool = True,
                  yolo_model: str = "yolov8n-pose.pt",
                  model_complexity: int = 1):
-        self.mp_ext = MediaPipeExtractor(model_complexity)
-        self.yolo_ext: Optional[YOLOPoseExtractor] = None
 
-        if use_yolo and YOLO_AVAILABLE:
+        self.yolo_ext: Optional[YOLOPoseExtractor] = None
+        self.mp_drawer: Optional[MediaPipeDrawer]  = None
+
+        if YOLO_AVAILABLE:
             try:
                 self.yolo_ext = YOLOPoseExtractor(yolo_model)
+                print("[PoseEngine] YOLO Pose loaded OK")
             except Exception as e:
-                print(f"[PoseEngine] YOLO load failed: {e} → MediaPipe only")
-    def process_multi(self, frame_bgr: np.ndarray) -> list[PersonData]:
+                print(f"[PoseEngine] YOLO load failed: {e}")
+        else:
+            print("[PoseEngine] ultralytics không có — không thể detect")
+
+        # MediaPipe chỉ để vẽ
+        try:
+            self.mp_drawer = MediaPipeDrawer(model_complexity)
+        except Exception:
+            self.mp_drawer = None
+
+    # ── Multi-person (YOLO tracking) ──────────────────────────────────────────
+
+    def process_multi(self, frame_bgr: np.ndarray) -> List[PersonData]:
         """
-        Detect nhiều người → trả list PersonData
-        Dùng YOLO tracking để gán person_id ổn định
+        Detect + track nhiều người bằng YOLO ByteTrack.
+        Trả list PersonData — mỗi người có ID ổn định, metrics từ YOLO thuần.
         """
         if self.yolo_ext is None:
             return []
-        h, w = frame_bgr.shape[:2]
-        results = []
 
-        # YOLO track — gán ID ổn định qua các frame
+        h, w = frame_bgr.shape[:2]
+
         yolo_results = self.yolo_ext.model.track(
             frame_bgr,
-            persist=True,           # giữ ID qua frame
-            tracker="bytetrack.yaml",
+            persist=True,
+            tracker=_TRACKER_CFG,
             verbose=False,
         )
 
-        if (yolo_results is None or
-                yolo_results[0].boxes is None or
-                len(yolo_results[0].boxes) == 0):
+        if (yolo_results is None
+                or yolo_results[0].boxes is None
+                or len(yolo_results[0].boxes) == 0):
             return []
 
-        boxes   = yolo_results[0].boxes
-        kps_all = yolo_results[0].keypoints
+        boxes    = yolo_results[0].boxes
+        kps_all  = yolo_results[0].keypoints
+        results  = []
 
         for i in range(len(boxes)):
-            # Lấy person_id từ tracker
+            bbox_conf = float(boxes.conf[i])
+
+            # Bỏ qua detection yếu
+            if bbox_conf < 0.45:
+                continue
+
             person_id = int(boxes.id[i]) if boxes.id is not None else i
+            kp_data   = kps_all.data[i].cpu().numpy()   # (17, 3): x, y, conf
 
-            # YOLO keypoints của người này
-            kp_data  = kps_all.data[i].cpu().numpy()  # (17, 3)
-            yolo_kp  = np.zeros((17, 4), dtype=np.float32)
+            # Raw keypoints cho Transformer
+            yolo_kp = np.zeros((17, 4), dtype=np.float32)
             for j, k in enumerate(kp_data[:17]):
-                yolo_kp[j] = [k[0]/w, k[1]/h, 0.0, k[2]]
+                yolo_kp[j] = [k[0]/w, k[1]/h, 0.0, float(k[2])]
 
-            # Crop frame theo bbox → đưa vào MediaPipe
-            x1, y1, x2, y2 = map(int, boxes.xyxy[i])
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
-            crop = frame_bgr[y1:y2, x1:x2]
-
-            mp_kp = np.zeros((33, 4), dtype=np.float32)
-            mp_metrics = None
-            if crop.shape[0] > 10 and crop.shape[1] > 10:
-                mp_m, _, mp_raw = self.mp_ext.extract(crop)
-                if mp_raw is not None:
-                    mp_kp = mp_raw
-                if mp_m is not None:
-                    # MediaPipe nhận crop → tọa độ trả về là hệ crop (pixel).
-                    # Phải cộng offset bbox để đưa về hệ full-frame trước khi fusion với YOLO.
-                    mp_m.center_x   += x1;  mp_m.center_y   += y1
-                    mp_m.shoulder_y += y1;  mp_m.hip_y      += y1
-                    mp_m.ankle_y    += y1;  mp_m.knee_l_y   += y1
-                    mp_m.knee_r_y   += y1;  mp_m.nose_y     += y1
-                    mp_m.wrist_l_y  += y1;  mp_m.wrist_r_y  += y1
-                    mp_metrics = mp_m
-
-            # Fusion raw_kp
+            # Phần MediaPipe để trống (zeros) — Transformer đã được train với format này
+            mp_kp  = np.zeros((33, 4), dtype=np.float32)
             raw_kp = np.concatenate([mp_kp, yolo_kp]).flatten()  # (200,)
 
-            # Tính BodyMetrics từ YOLO keypoints
-            metrics = self._yolo_kp_to_metrics(kp_data, boxes.conf[i], h, w)
-            if mp_metrics:
-                # Weighted fusion nếu có MediaPipe
-                wm = float(mp_metrics.confidence)
-                wy = float(boxes.conf[i])
-                t  = wm + wy + 1e-9
-                metrics.center_y     = (mp_metrics.center_y*wm + metrics.center_y*wy)/t
-                metrics.body_angle   = (mp_metrics.body_angle*wm + metrics.body_angle*wy)/t
-                metrics.aspect_ratio = (mp_metrics.aspect_ratio*wm + metrics.aspect_ratio*wy)/t
+            # Bbox từ YOLO detector
+            x1, y1, x2, y2 = map(int, boxes.xyxy[i])
+            x1 = max(0, x1); y1 = max(0, y1)
+            x2 = min(w, x2); y2 = min(h, y2)
+
+            # Metrics thuần YOLO — không fusion với MediaPipe
+            metrics = self.yolo_ext.kp_to_metrics(kp_data, bbox_conf, h, w)
 
             results.append(PersonData(
                 person_id = person_id,
@@ -300,89 +290,65 @@ class PoseEngine:
 
         return results
 
-    # ── Single-person API ─────────────────────────────────────────────────────
+    # ── Single-person fallback (YOLO only, không tracking) ────────────────────
 
-    def _yolo_kp_to_metrics(self, kp_data: np.ndarray, conf: float,
-                             h: int, w: int) -> BodyMetrics:
-        """Convert YOLO 17-keypoint array (pixel coords) to BodyMetrics."""
-        def kp(i):
-            if i < len(kp_data):
-                row = kp_data[i]
-                return np.array([float(row[0]), float(row[1]),
-                                 float(row[2]) if len(row) > 2 else 1.0])
-            return np.zeros(3)
-
-        l_sh = kp(5);  r_sh = kp(6)
-        l_hp = kp(11); r_hp = kp(12)
-        l_kn = kp(13); r_kn = kp(14)
-        l_an = kp(15); r_an = kp(16)
-
-        shoulder   = (l_sh[:2] + r_sh[:2]) / 2
-        hip        = (l_hp[:2] + r_hp[:2]) / 2
-        ankle      = (l_an[:2] + r_an[:2]) / 2
-        spine      = hip - shoulder
-        body_angle = math.degrees(math.atan2(abs(spine[0]), abs(spine[1]) + 1e-6))
-
-        pts  = np.array([l_sh[:2], r_sh[:2], l_hp[:2], r_hp[:2],
-                         l_kn[:2], r_kn[:2], l_an[:2], r_an[:2]])
-        xmin, ymin = pts.min(0); xmax, ymax = pts.max(0)
-        bw = max(xmax - xmin, 1.0); bh = max(ymax - ymin, 1.0)
-        ankle_hip = abs(ankle[1] - hip[1]) + 1e-6
-
-        return BodyMetrics(
-            shoulder_y   = float(shoulder[1]),
-            hip_y        = float(hip[1]),
-            ankle_y      = float(ankle[1]),
-            knee_l_y     = float(l_kn[1]),
-            knee_r_y     = float(r_kn[1]),
-            body_angle   = body_angle,
-            aspect_ratio = bh / bw,
-            center_x     = float((xmin + xmax) / 2),
-            center_y     = float((ymin + ymax) / 2),
-            bbox_w       = float(bw),
-            bbox_h       = float(bh),
-            confidence   = float(conf),
-            source       = "yolo",
-            knee_lift_l  = max(0.0, float(hip[1] - l_kn[1])) / ankle_hip,
-            knee_lift_r  = max(0.0, float(hip[1] - r_kn[1])) / ankle_hip,
-        )
-
-    def process(
-        self, frame_bgr: np.ndarray
-    ) -> Tuple[Optional[BodyMetrics], Optional[object], np.ndarray]:
+    def process(self, frame_bgr: np.ndarray
+                ) -> Tuple[Optional[BodyMetrics], Optional[object], np.ndarray]:
         """
-        Single-person detection: MediaPipe primary + optional YOLO.
-        Returns (metrics_or_None, mp_landmarks_or_None, raw_kp (200,)).
-        raw_kp is always a valid (200,) array (zeros when no person detected).
+        Single-frame YOLO inference — không tracking, không MediaPipe.
+        Chỉ dùng khi process_multi() trả về rỗng.
+        Trả (metrics_or_None, None, raw_kp(200,)).
         """
-        h, w     = frame_bgr.shape[:2]
-        yolo_kp  = np.zeros((17, 4), dtype=np.float32)
+        h, w   = frame_bgr.shape[:2]
+        raw_kp = np.zeros(200, dtype=np.float32)
 
-        # MediaPipe
-        mp_metrics, landmarks, mp_raw = self.mp_ext.extract(frame_bgr)
-        mp_kp = mp_raw if mp_raw is not None else np.zeros((33, 4), dtype=np.float32)
+        if self.yolo_ext is None:
+            return None, None, raw_kp
 
-        # YOLO (optional, single-frame inference — not tracking)
-        if self.yolo_ext is not None:
-            try:
-                yr = self.yolo_ext.model(frame_bgr, verbose=False)
-                if yr[0].keypoints is not None and len(yr[0].keypoints.data) > 0:
-                    kp_data = yr[0].keypoints.data[0].cpu().numpy()
-                    for i, k in enumerate(kp_data[:17]):
-                        yolo_kp[i] = [k[0] / w, k[1] / h, 0.0, k[2]]
-                    if mp_metrics is None and yr[0].boxes is not None and len(yr[0].boxes) > 0:
-                        mp_metrics = self._yolo_kp_to_metrics(
-                            kp_data, float(yr[0].boxes.conf[0]), h, w)
-            except Exception:
-                pass
+        try:
+            yr = self.yolo_ext.model(frame_bgr, verbose=False)
+            if (yr is None
+                    or yr[0].boxes is None
+                    or len(yr[0].boxes) == 0
+                    or yr[0].keypoints is None):
+                return None, None, raw_kp
 
-        raw_kp = np.concatenate([mp_kp, yolo_kp]).flatten()  # (200,)
-        return mp_metrics, landmarks, raw_kp
+            # Lấy người có confidence cao nhất
+            best = int(yr[0].boxes.conf.argmax())
+            if float(yr[0].boxes.conf[best]) < 0.45:
+                return None, None, raw_kp
 
-    def draw_skeleton(
-        self, frame: np.ndarray, landmarks, color: tuple = (80, 220, 80)
-    ) -> None:
-        self.mp_ext.draw(frame, landmarks, color)
+            kp_data = yr[0].keypoints.data[best].cpu().numpy()
+            yolo_kp = np.zeros((17, 4), dtype=np.float32)
+            for j, k in enumerate(kp_data[:17]):
+                yolo_kp[j] = [k[0]/w, k[1]/h, 0.0, float(k[2])]
+
+            mp_kp  = np.zeros((33, 4), dtype=np.float32)
+            raw_kp = np.concatenate([mp_kp, yolo_kp]).flatten()
+
+            metrics = self.yolo_ext.kp_to_metrics(
+                kp_data, float(yr[0].boxes.conf[best]), h, w
+            )
+            return metrics, None, raw_kp
+
+        except Exception:
+            return None, None, raw_kp
+
+    # ── Skeleton drawing (MediaPipe drawer) ───────────────────────────────────
+
+    def draw_skeleton(self, frame: np.ndarray, landmarks,
+                      color: tuple = (80, 220, 80)) -> None:
+        """Vẽ skeleton nếu có landmarks từ MediaPipe drawer."""
+        if self.mp_drawer is not None and landmarks is not None:
+            self.mp_drawer.draw(frame, landmarks, color)
+
+    def get_mp_landmarks(self, frame_bgr: np.ndarray):
+        """Lấy landmarks từ MediaPipe để vẽ (không ảnh hưởng detection)."""
+        if self.mp_drawer is None:
+            return None
+        return self.mp_drawer.extract_landmarks(frame_bgr)
 
     def close(self) -> None:
-        self.mp_ext.close()
+        if self.mp_drawer is not None:
+            self.mp_drawer.close()
+

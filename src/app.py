@@ -63,6 +63,11 @@ class FallDetectionApp:
         self._patient_last_state: dict[str, PoseState] = {}
         self._patient_last_sent:  dict[str, float]     = {}
 
+        self._last_sent_pose_state: PoseState = PoseState.UNKNOWN
+        self._last_sent_pose_time: float = 0.0
+
+        self._last_known_patient: tuple = None  # (person_id, name, notify_on_fall)
+
         self._family_manager = None   # khởi tạo trong _start()
 
         self._backend = BackendClient(
@@ -141,7 +146,7 @@ class FallDetectionApp:
         make_btn(br, "↺", self._reset_falls, fg=T["text"]).pack(side="left")
 
         src_row = tk.Frame(ctrl, bg=BG); src_row.pack(fill="x", pady=(0, 6))
-        make_btn(src_row, "📂 Chọn video", self._pick_video, fg=T["text"]).pack(
+        make_btn(src_row, " Chọn video", self._pick_video, fg=T["text"]).pack(
             side="left", fill="x", expand=True, padx=(0, 3))
         make_btn(src_row, "📷 Webcam", self._set_webcam, fg=T["text"]).pack(
             side="left", fill="x", expand=True)
@@ -659,12 +664,17 @@ class FallDetectionApp:
         persons = wf.recognized_persons
         if persons:
             known = [p for p in persons if p.is_known]
-            best  = max(known, key=lambda p: p.confidence) if known else persons[0]
+            best = max(known, key=lambda p: p.confidence) if known else persons[0]
             if best.is_known:
                 self._face_name_lbl.config(text=best.name, fg=T["face"])
                 self._face_conf_lbl.config(
                     text=f"Confidence: {best.confidence:.0%}  |  ID: {best.person_id}",
                     fg=T["sub"])
+                # Lưu lại patient cuối cùng được nhận ra
+                if best.is_patient:
+                    self._last_known_patient = (
+                        best.person_id, best.name, best.notify_on_fall
+                    )
             else:
                 self._face_name_lbl.config(text="Không nhận ra", fg=T["warn"])
                 self._face_conf_lbl.config(text=f"{len(persons)} khuôn mặt", fg=T["sub"])
@@ -674,27 +684,43 @@ class FallDetectionApp:
 
     def _maybe_send_pose_event(self, wf: WorkerFrame):
         result = wf.result
-        if self._frame_id % 30 != 0 or not result.metrics:
+        if not result.metrics:
             return
+
+        now = time.time()
+        state_changed = result.state != self._last_sent_pose_state
+        heartbeat_due = now - self._last_sent_pose_time >= 10.0
+
+        # Chỉ gửi khi state đổi HOẶC heartbeat 10s
+        if not state_changed and not heartbeat_due:
+            return
+
+        # Bỏ qua UNKNOWN — không có ý nghĩa gửi lên backend
+        if result.state == PoseState.UNKNOWN:
+            return
+
+        self._last_sent_pose_state = result.state
+        self._last_sent_pose_time = now
+
         m = result.metrics
         self._backend.send_pose(PoseEvent(
-            event_type        = EventType.POSE_CHANGE,
-            camera_id         = "cam_0",
-            timestamp         = wf.timestamp,
-            state             = result.state,
-            prev_state        = result.prev_state,
-            velocity_px_per_s = result.velocity_y,
-            metrics           = BodyMetricsPayload(
-                body_angle   = m.body_angle,
-                aspect_ratio = m.aspect_ratio,
-                center_x     = m.center_x,
-                center_y     = m.center_y,
-                confidence   = m.confidence,
-                hip_y        = m.hip_y,
-                shoulder_y   = m.shoulder_y,
-                ankle_y      = m.ankle_y,
+            event_type=EventType.POSE_CHANGE,
+            camera_id="cam_0",
+            timestamp=wf.timestamp,
+            state=result.state,
+            prev_state=result.prev_state,
+            velocity_px_per_s=result.velocity_y,
+            metrics=BodyMetricsPayload(
+                body_angle=m.body_angle,
+                aspect_ratio=m.aspect_ratio,
+                center_x=m.center_x,
+                center_y=m.center_y,
+                confidence=m.confidence,
+                hip_y=m.hip_y,
+                shoulder_y=m.shoulder_y,
+                ankle_y=m.ankle_y,
             ),
-            frame_id          = self._frame_id,
+            frame_id=self._frame_id,
         ))
 
     def _update_audio_panel(self, wf: WorkerFrame):
@@ -791,75 +817,138 @@ class FallDetectionApp:
         return wf.result.state  # single-person fallback
 
     def _update_patient_monitoring(self, wf: "WorkerFrame"):
-        """Theo dõi và gửi tư thế cho từng bệnh nhân được nhận diện."""
-        fe = self._worker._face_engine if self._worker else None
-        patient_rows: list = []
         now = time.time()
+        patient_rows: list = []
 
-        for person in wf.recognized_persons:
-            if not person.is_known:
-                continue
-            # Bỏ qua nếu cả is_patient lẫn notify_on_fall đều False
-            if not person.is_patient and not person.notify_on_fall:
-                continue
-            # Chỉ gửi PatientPoseEvent nếu is_patient=True
-            if not person.is_patient:
-                continue
-
-            current_state = self._get_patient_pose(person, wf)
-            last_state    = self._patient_last_state.get(person.person_id)
-            last_sent     = self._patient_last_sent.get(person.person_id, 0.0)
-
-            state_changed = current_state != last_state
-            heartbeat_due = now - last_sent >= 8.0
-
-            if state_changed or heartbeat_due:
-                self._patient_last_state[person.person_id] = current_state
-                self._patient_last_sent[person.person_id]  = now
-
-                # Không gửi nếu feature tắt hoặc notify_on_fall=False
-                if not self._features.enable_patient_pose_notification:
+        # ── Ưu tiên: dùng face recognition nếu nhận ra được ─────────────
+        if wf.recognized_persons:
+            for person in wf.recognized_persons:
+                if not person.is_known or not person.is_patient:
                     continue
-                if not person.notify_on_fall:
-                    continue  # nhận ra người nhưng không gửi thông báo
-
-                m = wf.result.metrics
-                event = PatientPoseEvent(
-                    event_type  = EventType.PATIENT_POSE,
-                    camera_id   = "cam_0",
-                    timestamp   = wf.timestamp,
-                    person_id   = person.person_id,
-                    person_name = person.name,
-                    state       = current_state,
-                    prev_state  = last_state or PoseState.UNKNOWN,
-                    metrics     = BodyMetricsPayload(
-                        body_angle   = m.body_angle   if m else 0.0,
-                        aspect_ratio = m.aspect_ratio if m else 0.0,
-                        center_x     = m.center_x     if m else 0.0,
-                        center_y     = m.center_y     if m else 0.0,
-                        confidence   = m.confidence   if m else 0.0,
-                        hip_y        = m.hip_y        if m else 0.0,
-                        shoulder_y   = m.shoulder_y   if m else 0.0,
-                        ankle_y      = m.ankle_y      if m else 0.0,
-                    ),
-                    frame_id = self._frame_id,
+                self._send_patient_pose_for_person(
+                    person.person_id, person.name,
+                    person.notify_on_fall, wf, now, patient_rows
                 )
-                self._backend.send_patient_pose(event)
 
-                if state_changed and last_state is not None:
-                    lbl_old = STATE_LABELS_VN.get(last_state, "?")
-                    lbl_new = STATE_LABELS_VN.get(current_state, "?")
-                    self._log_ev(
-                        f"🏥 {person.name}: {lbl_old} → {lbl_new}")
-
-            patient_rows.append((person.name, current_state, now))
+        # ── Fallback: mặt bị mất (nằm/quay lưng) nhưng YOLO vẫn thấy người
+        elif (self._last_known_patient is not None
+              and (wf.result.state != PoseState.UNKNOWN
+                   or bool(wf.all_person_results))):
+            pid, pname, pnotify = self._last_known_patient
+            self._send_patient_pose_for_person(
+                pid, pname, pnotify, wf, now, patient_rows
+            )
 
         self._update_patient_panel(patient_rows)
 
+    def _send_patient_pose_for_person(self, pid, pname, notify_on_fall,
+                                      wf: "WorkerFrame", now: float,
+                                      patient_rows: list):
+        """Gửi PatientPoseEvent cho 1 bệnh nhân, có debounce."""
+        if not self._features.enable_patient_pose_notification:
+            return
+        if not notify_on_fall:
+            return
+
+        current_state = self._get_patient_pose_by_pid(pid, wf)
+        last_state = self._patient_last_state.get(pid)
+        last_sent = self._patient_last_sent.get(pid, 0.0)
+
+        display_state = current_state if current_state != PoseState.UNKNOWN else (
+                last_state or PoseState.UNKNOWN
+        )
+        patient_rows.append((pname, display_state, now))
+
+        # # FIX 1: người mới detect (last_state=None) → lưu state, không gửi ngay
+        # if last_state is None:
+        #     self._patient_last_state[pid] = current_state
+        #     self._patient_last_sent[pid] = now
+        #     print(f"[Patient] NEW pid={pid} state={current_state}")  # DEBUG
+        #     return
+        #
+        # # FIX 2: debounce 2 giây
+        # if now - last_sent < 8.0:
+        #     return
+        #
+        # # FIX 3: skip nếu state giống lần trước
+        # if current_state == last_state:
+        #     return
+        #
+        #
+        #     # FIX 4: skip UNKNOWN, WALKING và SITTING (hiển thị UI nhưng không gửi notification)
+        # # FIX 4: skip UNKNOWN và WALKING
+        # if current_state in (PoseState.UNKNOWN, PoseState.WALKING):
+        #     return
+
+        # FIX 1: người mới detect → gửi luôn state đầu tiên
+        if last_state is None:
+            self._patient_last_state[pid] = PoseState.UNKNOWN
+            self._patient_last_sent[pid] = 0.0
+            print(f"[Patient] NEW pid={pid} state={current_state}")
+            # không return → xuống FIX 2,3,4 bình thường
+
+        # FIX 2: debounce 8 giây
+        if now - last_sent < 8.0:
+            return
+
+        # FIX 3: skip nếu state giống lần trước
+        if current_state == last_state:
+            return
+
+        # FIX 4: skip UNKNOWN và WALKING
+        if current_state in (PoseState.UNKNOWN, PoseState.WALKING):
+            return
+
+
+        self._patient_last_state[pid] = current_state
+        self._patient_last_sent[pid] = now
+        print(f"[Patient] SEND pid={pid} {last_state}→{current_state} gap={now - last_sent:.1f}s")  # DEBUG
+
+        m = wf.result.metrics
+        event = PatientPoseEvent(
+            event_type=EventType.PATIENT_POSE,
+            camera_id="cam_0",
+            timestamp=wf.timestamp,
+            person_id=pid,
+            person_name=pname,
+            state=current_state,
+            prev_state=last_state if last_state is not None else PoseState.UNKNOWN,
+            metrics=BodyMetricsPayload(
+                body_angle=m.body_angle if m else 0.0,
+                aspect_ratio=m.aspect_ratio if m else 0.0,
+                center_x=m.center_x if m else 0.0,
+                center_y=m.center_y if m else 0.0,
+                confidence=m.confidence if m else 0.0,
+                hip_y=m.hip_y if m else 0.0,
+                shoulder_y=m.shoulder_y if m else 0.0,
+                ankle_y=m.ankle_y if m else 0.0,
+            ),
+            frame_id=self._frame_id,
+        )
+        self._backend.send_patient_pose(event)
+
+        lbl_old = STATE_LABELS_VN.get(last_state, "?")
+        lbl_new = STATE_LABELS_VN.get(current_state, "?")
+        self._log_ev(f"🏥 {pname}: {lbl_old} → {lbl_new}")
+
+    def _get_patient_pose_by_pid(self, pid, wf: "WorkerFrame") -> PoseState:
+        """Lấy pose state của bệnh nhân theo person_id, fallback về wf.result.state."""
+        if wf.all_person_results:
+            # Tìm theo person_id nếu có face match
+            for person in wf.recognized_persons:
+                if person.person_id == pid:
+                    return self._get_patient_pose(person, wf)
+            # Không tìm thấy face → dùng result tổng
+            return wf.result.state
+        return wf.result.state
+
     _STATE_TAG = {
-        PoseState.STANDING: "stand", PoseState.SITTING: "sit",
-        PoseState.LYING:    "lie",   PoseState.WALKING: "walk",
-        PoseState.FALLING:  "fall",  PoseState.UNKNOWN: "dim",
+        PoseState.STANDING: "stand",
+        PoseState.SITTING: "sit",
+        PoseState.LYING: "lie",
+        PoseState.WALKING: "walk",
+        PoseState.FALLING: "fall",
+        PoseState.UNKNOWN: "dim",
     }
 
     def _update_patient_panel(self, rows: list):

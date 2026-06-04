@@ -41,33 +41,42 @@ class EventType(str, Enum):
 
 class ThresholdConfig(BaseModel):
     """Ngưỡng phân loại tư thế và phát hiện té ngã — đồng bộ từ backend về."""
+
     # Pose classification
-    body_angle_lying:        float = Field(60.0,  description="Góc cột sống (°) để coi là nằm")
-    body_angle_sitting:      float = Field(45.0,  description="Góc cột sống (°) để coi là ngồi")
-    aspect_ratio_lying:      float = Field(0.35,  description="H/W bbox < ngưỡng → nằm")
-    torso_ratio_sitting:     float = Field(0.42,  description="Tỉ lệ torso để phân biệt đứng/ngồi")
-    bend_shoulder_drop_threshold: float = 40.0  # px shoulder xuống so với baseline
-    bend_hip_max_drop: float = 25.0  # px hip tối đa xuống (nếu lớn hơn → fall)
+    min_confidence:          float = Field(0.5,  description="Confidence tối thiểu")
+    body_angle_lying:        float = Field(50.0, description="Góc thân (°) để coi là nằm")
+    aspect_ratio_lying:      float = Field(0.55, description="H/W bbox để coi là nằm")
+
+    # Bending guard
+    bend_shoulder_drop_threshold: float = 40.0
+    bend_hip_max_drop:            float = 25.0
+
     # Fall detection
-    fall_velocity_threshold: float = Field(40.0,  description="Vận tốc xuống (px/s) trigger fall")
-    fall_confirm_frames:     int   = Field(10,     description="Số frame LYING liên tiếp để confirm")
-    fall_history_window:     int   = Field(30,    description="Cửa sổ frame tính velocity")
+    fall_velocity_threshold: float = Field(40.0, description="Vận tốc xuống (px/s) trigger fall")
+    fall_confirm_frames:     int   = Field(10,   description="Số frame LYING liên tiếp để confirm")
+    fall_history_window:     int   = Field(30,   description="Cửa sổ frame tính velocity")
+    fall_transition_max_s:   float = Field(2.5,  description="Thời gian tối đa đứng→nằm để coi là té")
+
     # Walking
-    walk_velocity_threshold:  float = Field(20.0,  description="Vận tốc ngang (px/s) detect đi")
-    walk_knee_lift_threshold: float = Field(0.08,  description="Ngưỡng nâng gối chuẩn hóa")
-    walk_alternating_window:  int   = Field(15,    description="Số frame kiểm tra gối xen kẽ")
-    # Fall transition time guard
-    fall_transition_max_s:   float = Field(2.5,   description="Nếu từ đứng → nằm mất hơn N giây → không phải té")
-    # Sleep-as-fall: treat prolonged lying as fall (feature-flag controlled)
-    sleep_confirm_frames:    int   = Field(150, description="Số frame LYING để coi là ngủ/nằm = té (≈5s @ 30fps)")
+    walk_velocity_threshold:  float = Field(20.0, description="Vận tốc ngang (px/s) detect đi")
+    walk_knee_lift_threshold: float = Field(0.08, description="Ngưỡng nâng gối chuẩn hóa")
+    walk_alternating_window:  int   = Field(15,   description="Số frame kiểm tra gối xen kẽ")
+
+    # Sleep-as-fall
+    sleep_confirm_frames: int = Field(150, description="Số frame LYING để coi là ngủ = té")
+
+    sitting_ar_min: float = Field(0.50, description="aspect_ratio min khi ngồi")
+    sitting_ar_max: float = Field(1.70, description="aspect_ratio max khi ngồi")
+    sitting_angle_max: float = Field(40.0, description="body_angle max khi ngồi")
+    sitting_hip_ankle_max: float = Field(0.75, description="hip_ankle_ratio max khi ngồi")
+
     # Camera
-    camera_index:            int   = Field(0)
-    flip_horizontal:         bool  = Field(True)
-    model_complexity:        int   = Field(1, ge=0, le=2)
+    camera_index:     int  = Field(0)
+    flip_horizontal:  bool = Field(True)
+    model_complexity: int  = Field(1, ge=0, le=2)
 
     class Config:
         from_attributes = True
-
 
 class FeatureConfig(BaseModel):
     """Feature flags controlled by backend (mobile app) — not local UI state."""
