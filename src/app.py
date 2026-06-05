@@ -250,44 +250,44 @@ class FallDetectionApp:
 
         _sep()
 
-        # ── 6. CHỈ SỐ ────────────────────────────────────────────────────
-        mc = _section("CHỈ SỐ")
-        for row_data in [
-            ("Vel Y", "_lbl_vy",  "Vel X", "_lbl_vx"),
-            ("Góc",   "_lbl_ang", "H/W",   "_lbl_ratio"),
-            ("Src",   "_lbl_src", "FPS",   "_lbl_fps"),
-        ]:
-            r = tk.Frame(mc, bg=BG); r.pack(fill="x", pady=1)
-            for i in [0, 2]:
-                tk.Label(r, text=row_data[i]+":", font=("Courier New", 7),
-                         fg=T["sub"], bg=BG, width=6, anchor="w").pack(side="left")
-                lbl = tk.Label(r, text="—", font=("Courier New", 8, "bold"),
-                               fg=T["text"], bg=BG, width=7, anchor="w")
-                lbl.pack(side="left")
-                setattr(self, row_data[i + 1], lbl)
-                if i == 0:
-                    tk.Label(r, text="│", font=("Courier New", 7),
-                             fg=T["border"], bg=BG).pack(side="left", padx=2)
+        # # ── 6. CHỈ SỐ ────────────────────────────────────────────────────
+        # mc = _section("CHỈ SỐ")
+        # for row_data in [
+        #     ("Vel Y", "_lbl_vy",  "Vel X", "_lbl_vx"),
+        #     ("Góc",   "_lbl_ang", "H/W",   "_lbl_ratio"),
+        #     ("Src",   "_lbl_src", "FPS",   "_lbl_fps"),
+        # ]:
+        #     r = tk.Frame(mc, bg=BG); r.pack(fill="x", pady=1)
+        #     for i in [0, 2]:
+        #         tk.Label(r, text=row_data[i]+":", font=("Courier New", 7),
+        #                  fg=T["sub"], bg=BG, width=6, anchor="w").pack(side="left")
+        #         lbl = tk.Label(r, text="—", font=("Courier New", 8, "bold"),
+        #                        fg=T["text"], bg=BG, width=7, anchor="w")
+        #         lbl.pack(side="left")
+        #         setattr(self, row_data[i + 1], lbl)
+        #         if i == 0:
+        #             tk.Label(r, text="│", font=("Courier New", 7),
+        #                      fg=T["border"], bg=BG).pack(side="left", padx=2)
+        #
+        # _sep()
+        #
+        # # ── 7. ÂM THANH (YAMNet) ────────────────────────────────────────
+        # au = _section("ÂM THANH (YAMNet)")
+        # au_hdr = tk.Frame(au, bg=BG); au_hdr.pack(fill="x")
+        # self._audio_status_lbl = tk.Label(au_hdr, text="KHÔNG KHẢ DỤNG",
+        #     font=("Courier New", 10, "bold"), fg=T["sub"], bg=BG, anchor="w")
+        # self._audio_status_lbl.pack(side="left")
+        # self._audio_api_badge = tk.Label(au_hdr, text="[API: —]",
+        #     font=("Courier New", 7), fg=T["sub"], bg=BG)
+        # self._audio_api_badge.pack(side="right")
+        # self._audio_class_lbl = tk.Label(au, text="",
+        #     font=("Courier New", 7), fg=T["sub"], bg=BG, anchor="w")
+        # self._audio_class_lbl.pack(fill="x")
+        # self._audio_conf_lbl = tk.Label(au, text="",
+        #     font=("Courier New", 7), fg=T["sub"], bg=BG, anchor="w")
+        # self._audio_conf_lbl.pack(fill="x")
 
-        _sep()
-
-        # ── 7. ÂM THANH (YAMNet) ────────────────────────────────────────
-        au = _section("ÂM THANH (YAMNet)")
-        au_hdr = tk.Frame(au, bg=BG); au_hdr.pack(fill="x")
-        self._audio_status_lbl = tk.Label(au_hdr, text="KHÔNG KHẢ DỤNG",
-            font=("Courier New", 10, "bold"), fg=T["sub"], bg=BG, anchor="w")
-        self._audio_status_lbl.pack(side="left")
-        self._audio_api_badge = tk.Label(au_hdr, text="[API: —]",
-            font=("Courier New", 7), fg=T["sub"], bg=BG)
-        self._audio_api_badge.pack(side="right")
-        self._audio_class_lbl = tk.Label(au, text="",
-            font=("Courier New", 7), fg=T["sub"], bg=BG, anchor="w")
-        self._audio_class_lbl.pack(fill="x")
-        self._audio_conf_lbl = tk.Label(au, text="",
-            font=("Courier New", 7), fg=T["sub"], bg=BG, anchor="w")
-        self._audio_conf_lbl.pack(fill="x")
-
-        _sep()
+        # _sep()
 
         # ── 8. SỰ KIỆN (expand, chiếm phần còn lại) ─────────────────────
         lc = tk.Frame(panel, bg=BG)
@@ -432,7 +432,6 @@ class FallDetectionApp:
         if self._worker:
             self._worker.reset_falls()
         self._fall_engine.reset()
-        self._fall_cnt.config(text="Số lần té: 0")
         self._alert_lbl.config(text="CHƯA PHÁT HIỆN", fg=T["ok"])
         self._log_ev("↺ Reset fall history")
 
@@ -472,21 +471,14 @@ class FallDetectionApp:
 
     def _sync_feature_badges(self):
         feat = self._features
-        face_state   = "BẬT" if feat.enable_face_recognition          else "TẮT"
-        audio_state  = "BẬT" if feat.enable_sound_detection           else "TẮT"
+        face_state = "BẬT" if feat.enable_face_recognition else "TẮT"
         notify_state = "BẬT" if feat.enable_patient_pose_notification else "TẮT"
-        face_color   = T["ok"] if feat.enable_face_recognition          else T["danger"]
-        audio_color  = T["ok"] if feat.enable_sound_detection           else T["danger"]
+        face_color = T["ok"] if feat.enable_face_recognition else T["danger"]
         notify_color = T["ok"] if feat.enable_patient_pose_notification else T["danger"]
         self._face_api_badge.config(
             text=f"[API: {face_state}]", fg=face_color)
-        self._audio_api_badge.config(
-            text=f"[API: {audio_state}]", fg=audio_color)
         self._patient_notify_badge.config(
             text=f"[API: {notify_state}]", fg=notify_color)
-        if feat.sleep_as_fall:
-            self._audio_class_lbl.config(
-                text="Chế độ: nằm = té ngã", fg=T["warn"])
 
     def _open_family_mgmt(self):
         FamilyManagementWindow(self)
@@ -536,7 +528,7 @@ class FallDetectionApp:
         self._update_ai_panel(wf)
         self._update_fall_panel(wf)
         self._update_face_panel(wf)
-        self._update_audio_panel(wf)
+
         self._update_patient_monitoring(wf)
         self._maybe_send_pose_event(wf)
         self._send_person_detected(wf)
@@ -565,28 +557,16 @@ class FallDetectionApp:
 
     def _update_state_panel(self, wf: WorkerFrame):
         result = wf.result
-        s  = str(result.state)
+        s = str(result.state)
         sc = STATE_COLOR_TK.get(s, T["sub"])
         self._state_lbl.config(text=STATE_LABELS_VN.get(s, "?"), fg=sc)
         conf = result.metrics.confidence if result.metrics else 0.0
         self._conf_lbl.config(text=f"Confidence: {conf:.0%}")
 
-        vy = result.velocity_y
-        self._lbl_vy.config(
-            text=f"{abs(vy):.0f}",
-            fg=T["danger"] if abs(vy) > self._config.fall_velocity_threshold else T["text"])
-        self._lbl_vx.config(text=f"{abs(result.velocity_x):.0f}")
-        if result.metrics:
-            self._lbl_ang.config(text=f"{result.metrics.body_angle:.1f}°")
-            self._lbl_ratio.config(text=f"{result.metrics.aspect_ratio:.2f}")
-            self._lbl_src.config(text=result.metrics.source)
-        self._lbl_fps.config(text=f"{wf.fps:.0f}")
-
         ok = self._backend.connected
         self._dot.config(
             text="● ONLINE" if ok else "● OFFLINE",
             fg=T["ok"] if ok else T["danger"])
-
     def _update_ai_panel(self, wf: WorkerFrame):
         tr = wf.transformer_result
         if tr is not None and tr.ready:
@@ -609,17 +589,11 @@ class FallDetectionApp:
             self._ai_buf.config(text="")
 
     def _update_fall_panel(self, wf: WorkerFrame):
-        result    = wf.result
-        tr        = wf.transformer_result
+        result = wf.result
+        tr = wf.transformer_result
         vel_y_abs = abs(result.velocity_y)
 
         decision = self._fall_engine.update(result, tr, vel_y_abs)
-
-        if decision.current_lying and decision.was_upright:
-            self._log_ev(
-                f"[VEL] vel_y={vel_y_abs:.0f}  dur={decision.lying_duration:.1f}s  "
-                f"rule={decision.rule_fall}  ai={tr.is_fall if tr and tr.ready else '-'}"
-            )
 
         if decision.final_fall:
             self._alert_blink = not self._alert_blink
@@ -646,10 +620,8 @@ class FallDetectionApp:
                 self._alert_lbl.config(text="ĐÃ PHỤC HỒI", fg=T["warn"])
                 self._fall_src_lbl.config(text="", fg=T["sub"])
 
-        self._fall_cnt.config(text=f"Số lần té: {result.fall_count}")
-
         should_beep = result.fall_just_triggered or (
-            decision.final_fall and not decision.rule_fall and not self._trans_fall_logged
+                decision.final_fall and not decision.rule_fall and not self._trans_fall_logged
         )
         self._beep.trigger(should_beep)
 

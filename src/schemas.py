@@ -120,6 +120,10 @@ class FallEvent(BaseModel):
     frame_id:          int           = 0
     clip_url:          Optional[str] = None
 
+    sound_detected: bool = False
+    sound_class: str = ""
+    sound_confidence: float = 0.0
+
 
 class FallEventResponse(BaseModel):
     event_id:  str

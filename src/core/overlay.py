@@ -206,17 +206,16 @@ class OverlayRenderer:
     # ── Render ────────────────────────────────────────────────────────────────
 
     def render(
-        self,
-        frame:              np.ndarray,
-        result:             DetectionResult,
-        fps:                float,
-        backend_ok:         bool  = False,
-        fall_vel_threshold: float = 80.0,
-        recognized_persons: List  = [],
+            self,
+            frame: np.ndarray,
+            result: DetectionResult,
+            fps: float,
+            backend_ok: bool = False,
+            fall_vel_threshold: float = 80.0,
+            recognized_persons: List = [],
     ) -> np.ndarray:
         self._state_badge(frame, result)
-        self._velocity_info(frame, result, fall_vel_threshold)
         self._face_boxes(frame, recognized_persons)
         self._stats_bar(frame, result, fps, backend_ok)
-        self._fall_alert(frame, result)   # cuối cùng để nằm trên cùng
+        self._fall_alert(frame, result)
         return frame

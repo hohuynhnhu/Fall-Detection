@@ -132,6 +132,7 @@ class CameraWorker(threading.Thread):
         self.fps             = 0.0
         self._last_frame:    Optional[np.ndarray] = None
         self._pending_audio: Optional[AudioResult] = None
+        self._pending_audio_for_fall: Optional[object] = None
 
         self._tracker:             Optional[TrackerManager] = None
         self._frame_num:           int  = 0
@@ -154,6 +155,7 @@ class CameraWorker(threading.Thread):
 
         self._clips_dir = Path(__file__).resolve().parent.parent.parent / "clips"
         self._clips_dir.mkdir(parents=True, exist_ok=True)
+        self._clip_thread: Optional[threading.Thread] = None
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -172,9 +174,24 @@ class CameraWorker(threading.Thread):
         self.features = feat
         for pipeline in self._person_pipelines.values():
             pipeline.update_features(feat)
-        if self._audio_engine is not None:
-            self._audio_engine.enabled        = feat.enable_sound_detection
-            self._audio_engine.listen_seconds = feat.sound_listen_seconds
+
+        # Bật/tắt audio engine theo feature
+        if feat.enable_sound_detection:
+            if self._audio_engine is None and AUDIO_ENGINE_AVAILABLE:
+                try:
+                    self._audio_engine = AudioEngine(
+                        listen_seconds=feat.sound_listen_seconds,
+                        on_result=self._on_audio_result,
+                    )
+                    print("[CameraWorker] AudioEngine khởi tạo từ feature update")
+                except Exception as e:
+                    print(f"[CameraWorker] AudioEngine init failed: {e}")
+            elif self._audio_engine is not None:
+                self._audio_engine.enabled = True
+                self._audio_engine.listen_seconds = feat.sound_listen_seconds
+        else:
+            if self._audio_engine is not None:
+                self._audio_engine.enabled = False
 
     # ── Reset ──────────────────────────────────────────────────────────────────
 
@@ -226,6 +243,7 @@ class CameraWorker(threading.Thread):
 
     def _on_audio_result(self, result: "AudioResult"):
         self._pending_audio = result
+        self._pending_audio_for_fall = result
 
     # ── Camera open ────────────────────────────────────────────────────────────
 
@@ -322,6 +340,13 @@ class CameraWorker(threading.Thread):
             if not ret:
                 if isinstance(self.camera_source, str) and not self._is_stream:
                     print("[CameraWorker] Video file kết thúc")
+                    # Chờ collect nốt post frames
+                    while self._post_remaining > 0:
+                        time.sleep(0.1)
+                    # Chờ clip thread upload + gửi backend
+                    if self._clip_thread is not None and self._clip_thread.is_alive():
+                        print("[CameraWorker] Đang chờ gửi fall event...")
+                        self._clip_thread.join(timeout=30)
                     break
                 consecutive_fail += 1
                 if self._is_stream and consecutive_fail <= 10:
@@ -567,16 +592,17 @@ class CameraWorker(threading.Thread):
                 self._post_frames.append(f)
                 self._post_remaining -= 1
                 if self._post_remaining == 0:
-                    threading.Thread(
+                    self._clip_thread = threading.Thread(
                         target=self._process_fall_clip,
                         args=(
                             self._pending_clip.get("pre_frames", []),
                             list(self._post_frames),
                             self._pending_clip.get("fall_data", {}),
                         ),
-                        daemon=True,
-                    ).start()
-                    self._post_frames  = []
+                        daemon=False,
+                    )
+                    self._clip_thread.start()
+                    self._post_frames = []
                     self._pending_clip = {}
 
             # ── Fall trigger → clip capture ────────────────────────────────
@@ -585,6 +611,7 @@ class CameraWorker(threading.Thread):
                 any(r.result.fall_just_triggered for r in all_person_results)
             )
             if _fall_triggered and self._post_remaining == 0:
+                self._pending_audio_for_fall = None
                 pre = list(self._frame_buffer)
                 m   = result.metrics
                 self._pending_clip = {
@@ -631,25 +658,28 @@ class CameraWorker(threading.Thread):
         if self._face_executor is not None:
             self._face_executor.shutdown(wait=False)
 
+        # Chờ clip thread gửi xong trước khi đóng
+        if self._clip_thread is not None and self._clip_thread.is_alive():
+            print("[CameraWorker] Chờ clip thread hoàn tất...")
+            self._clip_thread.join(timeout=60)
+
     # ── Clip save / upload / send ──────────────────────────────────────────────
     def _process_fall_clip(self, pre_frames: list, post_frames: list, fall_data: dict):
-        frames = pre_frames + post_frames
-        if not frames:
+        all_frames = pre_frames + post_frames
+        if not all_frames:
             return
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = self._clips_dir / f"fall_{ts}.mp4"
-        h, w = frames[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(path), fourcc, 30, (w, h))
-        for frm in frames:
-            writer.write(frm)
-        writer.release()
-        print(f"[CameraWorker] Clip saved: {path}  ({len(frames)} frames)")
+        fps = 30
+        take = 3 * fps
+        frames = all_frames[:take] + all_frames[-take:]
 
-        # Gửi event NGAY — không chờ Cloudinary
+        audio_res = None
+
+        # ── Gửi fall event NGAY (không có clip) ──────────────────────────────
+        event_id = None
         if self._backend_client is not None:
             try:
+                import httpx as _httpx
                 event = FallEvent(
                     event_type=EventType.FALL,
                     camera_id=self.camera_id,
@@ -660,14 +690,38 @@ class CameraWorker(threading.Thread):
                     max_velocity=fall_data.get("max_velocity", 0.0),
                     body_angle=fall_data.get("body_angle", 0.0),
                     confidence=fall_data.get("confidence", 0.0),
-                    clip_url=None,
+                    clip_url=None,  # chưa có clip
+                    sound_detected=False,
+                    sound_class="",
+                    sound_confidence=0.0,
                 )
-                self._backend_client.send_fall(event)
-                print(f"[CameraWorker] FallEvent sent (clip uploading...)")
+                r = _httpx.post(
+                    f"{self._backend_client.base_url}/events/fall",
+                    content=event.json().encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    timeout=10.0,
+                )
+                if r.status_code in (200, 201):
+                    event_id = r.json().get("id")
+                    print(f"[CameraWorker] FallEvent sent immediately — id={event_id}")
+                else:
+                    print(f"[CameraWorker] FallEvent send failed status={r.status_code}")
             except Exception as exc:
-                print(f"[CameraWorker] Backend send_fall failed: {exc}")
+                print(f"[CameraWorker] FallEvent immediate send failed: {exc}")
 
-        # Upload Cloudinary sau
+        # ── Ghi clip ──────────────────────────────────────────────────────────
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = self._clips_dir / f"fall_{ts}.mp4"
+        h, w = frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(path), fourcc, 30, (w, h))
+        for frm in frames:
+            writer.write(frm)
+        writer.release()
+        print(f"[CameraWorker] Clip saved: {path}  ({len(frames)} frames)")
+
+        # ── Upload Cloudinary ─────────────────────────────────────────────────
+        clip_url = None
         if _CLOUDINARY_OK:
             try:
                 res = cloudinary.uploader.upload(
@@ -685,60 +739,16 @@ class CameraWorker(threading.Thread):
                     path.unlink(missing_ok=True)
                 except Exception:
                     pass
-        else:
-            print("[CameraWorker] Cloudinary not configured — clip kept local")
-    # def _process_fall_clip(self, pre_frames: list, post_frames: list, fall_data: dict):
-    #     frames = pre_frames + post_frames
-    #     if not frames:
-    #         return
-    #
-    #     ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
-    #     path   = self._clips_dir / f"fall_{ts}.mp4"
-    #     h, w   = frames[0].shape[:2]
-    #     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    #     writer = cv2.VideoWriter(str(path), fourcc, 30, (w, h))
-    #     for frm in frames:
-    #         writer.write(frm)
-    #     writer.release()
-    #     print(f"[CameraWorker] Clip saved: {path}  ({len(frames)} frames)")
-    #
-    #     clip_url = ""
-    #     if _CLOUDINARY_OK:
-    #         try:
-    #             res = cloudinary.uploader.upload(
-    #                 str(path),
-    #                 resource_type = "video",
-    #                 folder        = "fall_detection",
-    #                 public_id     = f"fall_{ts}",
-    #             )
-    #             clip_url = res.get("secure_url", "")
-    #             print(f"[CameraWorker] Clip uploaded: {clip_url}")
-    #         except Exception as exc:
-    #             print(f"[CameraWorker] Cloudinary upload failed: {exc}")
-    #         finally:
-    #             try:
-    #                 path.unlink(missing_ok=True)
-    #             except Exception:
-    #                 pass
-    #     else:
-    #         print("[CameraWorker] Cloudinary not configured — clip kept local")
-    #
-    #     if self._backend_client is not None:
-    #         try:
-    #             event = FallEvent(
-    #                 event_type        = EventType.FALL,
-    #                 camera_id         = self.camera_id,
-    #                 timestamp         = fall_data.get("timestamp", time.time()),
-    #                 state             = PoseState.FALLING,
-    #                 state_before      = fall_data.get("state_before", PoseState.UNKNOWN),
-    #                 velocity_px_per_s = fall_data.get("velocity_px_per_s", 0.0),
-    #                 max_velocity      = fall_data.get("max_velocity", 0.0),
-    #                 body_angle        = fall_data.get("body_angle", 0.0),
-    #                 confidence        = fall_data.get("confidence", 0.0),
-    #                 clip_url          = clip_url or None,
-    #             )
-    #             self._backend_client.send_fall(event)
-    #             print(f"[CameraWorker] FallEvent sent (clip_url={'set' if clip_url else 'none'})")
-    #         except Exception as exc:
-    #             print(f"[CameraWorker] Backend send_fall failed: {exc}")
-#
+
+        # ── Cập nhật clip_url vào event đã gửi ───────────────────────────────
+        if clip_url and event_id and self._backend_client is not None:
+            try:
+                import httpx as _httpx
+                r = _httpx.patch(
+                    f"{self._backend_client.base_url}/events/fall/{event_id}",
+                    json={"clip_url": clip_url},
+                    timeout=10.0,
+                )
+                print(f"[CameraWorker] Clip URL updated — event_id={event_id} status={r.status_code}")
+            except Exception as exc:
+                print(f"[CameraWorker] Clip URL update failed: {exc}")

@@ -86,10 +86,18 @@ class BackendClient:
         self._running = False
         if self._loop and self._queue:
             try:
-                self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
+                # Chờ queue drain xong rồi mới signal stop
+                async def _drain_and_stop():
+                    # Chờ tối đa 30s để queue trống
+                    for _ in range(300):
+                        if self._queue.empty():
+                            break
+                        await asyncio.sleep(0.1)
+                    await self._queue.put(None)
+
+                asyncio.run_coroutine_threadsafe(_drain_and_stop(), self._loop)
             except Exception:
                 pass
-
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
