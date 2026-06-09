@@ -37,6 +37,7 @@ from .pose_engine import PoseEngine
 from .fall_detector import DetectionPipeline, DetectionResult
 from .overlay import STATE_SKELETON_COLORS
 from schemas import ThresholdConfig, FeatureConfig, PoseState, FallEvent, EventType
+from services.backend_client import GpsProvider
 
 try:
     from .face_engine import FaceEngine, RecognizedPerson, FaceBox
@@ -691,6 +692,7 @@ class CameraWorker(threading.Thread):
                     body_angle=fall_data.get("body_angle", 0.0),
                     confidence=fall_data.get("confidence", 0.0),
                     clip_url=None,  # chưa có clip
+                    gps=GpsProvider.get().location(),
                     sound_detected=False,
                     sound_class="",
                     sound_confidence=0.0,
@@ -699,7 +701,7 @@ class CameraWorker(threading.Thread):
                     f"{self._backend_client.base_url}/events/fall",
                     content=event.json().encode("utf-8"),
                     headers={"Content-Type": "application/json"},
-                    timeout=10.0,
+                    timeout=30.0,
                 )
                 if r.status_code in (200, 201):
                     event_id = r.json().get("id")
@@ -747,7 +749,7 @@ class CameraWorker(threading.Thread):
                 r = _httpx.patch(
                     f"{self._backend_client.base_url}/events/fall/{event_id}",
                     json={"clip_url": clip_url},
-                    timeout=10.0,
+                    timeout=30.0,
                 )
                 print(f"[CameraWorker] Clip URL updated — event_id={event_id} status={r.status_code}")
             except Exception as exc:

@@ -105,6 +105,9 @@ class BodyMetricsPayload(BaseModel):
 
 
 # ── Fall Event ────────────────────────────────────────────────────────────────
+class GpsLocation(BaseModel):
+    latitude: float
+    longitude: float
 
 class FallEvent(BaseModel):
     """POST /events/fall"""
@@ -119,7 +122,8 @@ class FallEvent(BaseModel):
     confidence:        float         = Field(0.0, ge=0, le=1)
     frame_id:          int           = 0
     clip_url:          Optional[str] = None
-
+    
+    gps: Optional[GpsLocation] = None
     sound_detected: bool = False
     sound_class: str = ""
     sound_confidence: float = 0.0

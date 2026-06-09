@@ -7,7 +7,7 @@ import threading
 import time
 import httpx
 from typing import Optional, Callable, List, Union
-
+import geocoder
 from schemas import (
     ThresholdConfig, FeatureConfig,
     FallEvent, PoseEvent, PersonDetectedPayload, PatientPoseEvent,
@@ -15,6 +15,44 @@ from schemas import (
     AddFamilyMemberPayload, FamilyMember, FamilyMembersResponse,
     PoseState,
 )
+
+
+class GpsProvider:
+    """Lấy tọa độ GPS qua IP, cache 5 phút."""
+    _instance: "GpsProvider | None" = None
+
+    def __init__(self, cache_ttl: float = 300.0):
+        self._ttl   = cache_ttl
+        self._cache: "GpsLocation | None" = None
+        self._fetched_at = 0.0
+        self._lock  = threading.Lock()
+
+    @classmethod
+    def get(cls) -> "GpsProvider":
+        if cls._instance is None:
+            cls._instance = GpsProvider()
+        return cls._instance
+
+    def location(self) -> "GpsLocation | None":
+        with self._lock:
+            now = time.time()
+            if self._cache and now - self._fetched_at < self._ttl:
+                return self._cache
+            try:
+                g = geocoder.ip("me")
+                if g.ok and g.latlng:
+                    from schemas import GpsLocation
+                    self._cache = GpsLocation(
+                        latitude=g.latlng[0],
+                        longitude=g.latlng[1],
+                    )
+                    self._fetched_at = now
+                    print(f"[GpsProvider] GPS fetched: {g.latlng}")
+                else:
+                    print(f"[GpsProvider] GPS FAIL: ok={g.ok} latlng={g.latlng}")
+            except Exception as e:
+                print(f"[GpsProvider] GPS ERROR: {e}")
+            return self._cache
 
 _AnyEvent = Union[FallEvent, PoseEvent, PersonDetectedPayload, PatientPoseEvent, FaceLogPayload]
 
@@ -121,6 +159,8 @@ class BackendClient:
     # ── Public send API ────────────────────────────────────────────────────────
 
     def send_fall(self, event: FallEvent):
+        event.gps = GpsProvider.get().location()
+        print(f"[BackendClient] send_fall GPS={event.gps}")
         self._enqueue(event)
 
     def send_pose(self, event: PoseEvent):
